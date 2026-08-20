@@ -10,6 +10,12 @@ Personal extensions for [Pi](https://pi.dev/), distributed as a Pi package.
 - **andrewrabert-dev** — registers Andrew Rabert's bundled development agents with the subagent extension.
 - **web-research** — provides public-web search and page fetching tools with SSRF protections.
 
+## Themes
+
+- **ansi-dark**
+- **base16**
+- **terminal-tinted**
+
 ## Install
 
 ```sh

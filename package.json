@@ -16,6 +16,9 @@
       "./extensions/subagent/index.ts",
       "./extensions/andrewrabert-dev/index.ts",
       "./extensions/web-research.ts"
+    ],
+    "themes": [
+      "./themes"
     ]
   },
   "dependencies": {
