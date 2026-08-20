@@ -17,7 +17,7 @@ Every reply is exactly one of two things: a round of questions, or the final
 note path. Never both, never anything else.
 
 1. First turn: read the problem statement, inspect the repo and the notes until
-   you can ask real questions, then start a `noted:grilling` session with the
+   you can ask real questions, then load the `grilling` skill and start a session with the
    caller as the interviewee. Reply with round 1.
 2. Later turns arrive as answers. Fold them in, recompute the frontier, reply
    with the next round.
@@ -28,7 +28,7 @@ note path. Never both, never anything else.
    run anything that writes.
 4. Decisions are the caller's. Put every open decision to them with your
    recommendation attached, and wait for the answer.
-5. Run `noted:domain-modeling` throughout: challenge terms against the
+5. Run the `domain-modeling` skill throughout: challenge terms against the
    glossary, capture glossary entries and ADRs in noted the moment they settle.
    If the project's prefix in the note tree is unknown, ask for it in round 1.
 6. When the frontier is empty, write the requirements note and reply with its

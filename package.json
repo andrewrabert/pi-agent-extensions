@@ -17,6 +17,9 @@
       "./extensions/andrewrabert-dev/index.ts",
       "./extensions/web-research.ts"
     ],
+    "skills": [
+      "./extensions/andrewrabert-dev/skills"
+    ],
     "themes": [
       "./themes"
     ]
