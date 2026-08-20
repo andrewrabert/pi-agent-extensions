@@ -39,7 +39,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { type AgentConfig, type AgentScope, discoverAgents, registerPackageAgentDir } from "./agents.ts";
 import { resolveToolPatterns } from "./tool-patterns.ts";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -493,6 +493,13 @@ const SubagentParams = Type.Object({
 export default function (pi: ExtensionAPI) {
 	let mainAgent: AgentConfig | undefined;
 	let toolsBeforeMainAgent: string[] | undefined;
+	const unregisterPackageAgentPathListener = pi.events.on(
+		"subagent:register-agent-path",
+		(data: unknown) => {
+			if (!data || typeof data !== "object" || !("path" in data) || typeof data.path !== "string") return;
+			registerPackageAgentDir(data.path);
+		},
+	);
 
 	const installAgentFooter = (ctx: ExtensionContext) => {
 		ctx.ui.setFooter((tui, theme, footerData) => {
@@ -723,6 +730,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		unregisterPackageAgentPathListener();
 		ctx.ui.setStatus("main-agent", undefined);
 		ctx.ui.setFooter(undefined);
 	});
@@ -733,7 +741,7 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
+			`Default agent scope is "user" (package agents plus ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
 		parameters: SubagentParams,

@@ -14,6 +14,7 @@
       "./extensions/loop-verifier.ts",
       "./extensions/noted-mcp/index.ts",
       "./extensions/subagent/index.ts",
+      "./extensions/andrewrabert-dev/index.ts",
       "./extensions/web-research.ts"
     ]
   },
