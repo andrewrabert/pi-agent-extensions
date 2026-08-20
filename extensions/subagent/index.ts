@@ -16,9 +16,9 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
-import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
 	DynamicBorder,
@@ -26,8 +26,6 @@ import {
 	type ExtensionContext,
 	getAgentDir,
 	getMarkdownTheme,
-	keyText,
-	ThinkingSelectorComponent,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -48,7 +46,6 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
-const DEFAULT_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] satisfies ThinkingLevel[];
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -181,8 +178,6 @@ interface SubagentDetails {
 	projectAgentsDir: string | null;
 	results: SingleResult[];
 }
-
-type MainAgentSelection = { kind: "thinking" } | { kind: "agent"; name: string };
 
 function getFinalOutput(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -628,37 +623,29 @@ export default function (pi: ExtensionAPI) {
 			const agents = discoverAgents(ctx.cwd, "user").agents.sort((a, b) => a.name.localeCompare(b.name));
 			let name = args.trim();
 
-			while (!name) {
-				const selected = await ctx.ui.custom<MainAgentSelection | null>((tui, theme, _keybindings, done) => {
+			if (!name) {
+				const selected = await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
+					const highlight = (text: string) => theme.bg("selectedBg", theme.fg("accent", theme.bold(text)));
 					const defaultDescription = "Use pi without a main agent.";
-					const thinkingItem: SelectItem = {
-						value: "Thinking level",
-						label: "Thinking level",
-						description: pi.getThinkingLevel(),
-					};
-					const defaultItem: SelectItem = {
-						value: "default",
-						label: mainAgent ? "default" : "● default",
-						description: defaultDescription,
-					};
-					const agentItems = agents.map((agent) => {
-						const isActive = agent.name === mainAgent?.name;
-						const description = firstSentence(agent.description);
-						return {
-							value: agent.name,
-							label: isActive ? `● ${agent.name}` : agent.name,
-							description,
-						};
-					});
-					const items = [thinkingItem, defaultItem, ...agentItems];
-					const selections = new Map<SelectItem, MainAgentSelection>([
-						[thinkingItem, { kind: "thinking" }],
-						[defaultItem, { kind: "agent", name: "default" }],
-						...agentItems.map((item) => [item, { kind: "agent" as const, name: item.value }] as const),
-					]);
+					const items: SelectItem[] = [
+						{
+							value: "default",
+							label: mainAgent ? "default" : highlight("default"),
+							description: mainAgent ? defaultDescription : highlight(defaultDescription),
+						},
+						...agents.map((agent) => {
+							const isActive = agent.name === mainAgent?.name;
+							const description = firstSentence(agent.description);
+							return {
+								value: agent.name,
+								label: isActive ? highlight(agent.name) : agent.name,
+								description: isActive ? highlight(description) : description,
+							};
+						}),
+					];
 					const container = new Container();
 					container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-					container.addChild(new Text("Switch main agent"));
+					container.addChild(new Text(theme.fg("accent", theme.bold("Switch main agent"))));
 
 					const selectList = new SelectList(items, Math.min(items.length, 10), {
 						selectedPrefix: (text) => theme.fg("accent", text),
@@ -667,17 +654,12 @@ export default function (pi: ExtensionAPI) {
 						scrollInfo: (text) => theme.fg("dim", text),
 						noMatch: (text) => theme.fg("warning", text),
 					});
-					const activeAgentName = mainAgent?.name;
-					const activeAgentIndex = activeAgentName
-						? agentItems.findIndex((item) => item.value === activeAgentName)
-						: -1;
-					selectList.setSelectedIndex(activeAgentIndex >= 0 ? activeAgentIndex + 2 : 1);
-					selectList.onSelect = (item) => done(selections.get(item) ?? null);
+					const activeIndex = mainAgent ? items.findIndex((item) => item.value === mainAgent?.name) : 0;
+					selectList.setSelectedIndex(Math.max(0, activeIndex));
+					selectList.onSelect = (item) => done(item.value);
 					selectList.onCancel = () => done(null);
 					container.addChild(selectList);
-					container.addChild(
-						new Text(`${keyText("tui.select.confirm")} select • ${keyText("tui.select.cancel")} cancel`),
-					);
+					container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter select • esc cancel")));
 					container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
 
 					return {
@@ -690,30 +672,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				});
 				if (!selected) return;
-				if (selected.kind === "agent") {
-					name = selected.name;
-					continue;
-				}
-
-				const levels = ctx.model ? getSupportedThinkingLevels(ctx.model) : DEFAULT_THINKING_LEVELS;
-				const selectedLevel = await ctx.ui.custom<ThinkingLevel | null>((tui, _theme, _keybindings, done) => {
-					const selector = new ThinkingSelectorComponent(
-						pi.getThinkingLevel(),
-						levels,
-						done,
-						() => done(null),
-					);
-					const selectList = selector.getSelectList();
-					return {
-						render: (width: number) => selector.render(width),
-						invalidate: () => selector.invalidate(),
-						handleInput: (data: string) => {
-							selectList.handleInput(data);
-							tui.requestRender();
-						},
-					};
-				});
-				if (selectedLevel) pi.setThinkingLevel(selectedLevel);
+				name = selected;
 			}
 
 			if (name === "default") {
