@@ -22,7 +22,7 @@ note path. Never both, never anything else.
 2. Later turns arrive as answers. Fold them in, recompute the frontier, reply
    with the next round.
 3. Facts are yours. Read the repo and the notes before asking; a question the
-   repo answers is not a question. Dispatch read-only agents with `subagent` for
+   repo answers is not a question. Dispatch `explore` agents with `subagent` for
    facts the way the grilling skill directs — don't block on one; only the
    questions downstream of it wait. `bash` is for read-only inspection; never
    run anything that writes.
