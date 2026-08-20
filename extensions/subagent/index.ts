@@ -520,17 +520,25 @@ export default function (pi: ExtensionAPI) {
 					const sessionName = ctx.sessionManager.getSessionName();
 					if (sessionName) pwd += ` • ${sessionName}`;
 
+					const agent = mainAgent
+						? truncateToWidth(theme.bg("selectedBg", ` ${mainAgent.name} `), width, "")
+						: "";
+					const availablePwd = Math.max(0, width - visibleWidth(agent) - (agent ? 1 : 0));
+					const displayedPwd = availablePwd
+						? truncateToWidth(theme.fg("dim", pwd), availablePwd, theme.fg("dim", "..."))
+						: "";
+					const agentPadding = " ".repeat(Math.max(0, width - visibleWidth(displayedPwd) - visibleWidth(agent)));
+
 					const context = ctx.getContextUsage();
 					const contextWindow = context?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 					const percent = context?.percent;
 					const contextText = `${context ? formatTokens(context.tokens) : "?"}/${formatTokens(contextWindow)}`;
-					const coloredContext =
+					let left =
 						percent !== null && percent !== undefined && percent > 90
 							? theme.fg("error", contextText)
 							: percent !== null && percent !== undefined && percent > 70
 								? theme.fg("warning", contextText)
 								: contextText;
-					let left = `agent:${mainAgent?.name ?? "default"} ${coloredContext}`;
 					const modelName = ctx.model?.id ?? "no-model";
 					const right = ctx.model?.reasoning
 						? `${modelName} • ${ctx.thinkingLevel === "off" ? "thinking off" : ctx.thinkingLevel}`
@@ -539,7 +547,7 @@ export default function (pi: ExtensionAPI) {
 					left = truncateToWidth(left, availableLeft || width, "...");
 					const padding = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
 					const lines = [
-						truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "...")),
+						truncateToWidth(displayedPwd + agentPadding + agent, width),
 						truncateToWidth(theme.fg("dim", left + padding + right), width),
 					];
 
@@ -589,15 +597,10 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("main-agent", `agent:${agent.name}`);
 	};
 
-	const deactivateMainAgent = (ctx: {
-		ui: {
-			setStatus: (id: string, text: string | undefined) => void;
-			theme: { fg: (color: "dim", text: string) => string };
-		};
-	}) => {
+	const deactivateMainAgent = (ctx: { ui: { setStatus: (id: string, text: string | undefined) => void } }) => {
 		mainAgent = undefined;
 		if (toolsBeforeMainAgent) pi.setActiveTools(toolsBeforeMainAgent);
-		ctx.ui.setStatus("main-agent", ctx.ui.theme.fg("dim", "agent:default"));
+		ctx.ui.setStatus("main-agent", undefined);
 	};
 
 	pi.registerFlag("agent", {
