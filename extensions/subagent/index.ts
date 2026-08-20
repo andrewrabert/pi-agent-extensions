@@ -515,8 +515,6 @@ export default function (pi: ExtensionAPI) {
 					if (relativeToHome === "" || (!relativeToHome.startsWith(`..${path.sep}`) && relativeToHome !== "..")) {
 						pwd = relativeToHome === "" ? "~" : `~${path.sep}${relativeToHome}`;
 					}
-					const branch = footerData.getGitBranch();
-					if (branch) pwd += ` (${branch})`;
 					const sessionName = ctx.sessionManager.getSessionName();
 					if (sessionName) pwd += ` • ${sessionName}`;
 
