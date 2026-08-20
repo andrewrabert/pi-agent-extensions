@@ -2,6 +2,9 @@
   "name": "pi-agent-extensions",
   "version": "0.1.0",
   "private": true,
+  "description": "Personal extensions for the Pi coding agent",
+  "license": "MIT",
+  "repository": "github:andrewrabert/pi-agent-extensions",
   "type": "module",
   "keywords": [
     "pi-package"
