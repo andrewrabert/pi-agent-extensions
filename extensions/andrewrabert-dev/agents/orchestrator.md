@@ -1,7 +1,7 @@
 ---
 name: orchestrator
 description: Routes explicit personal notes, logs, and tasks lookups to research, and all development work to the requirements, plan, execute, and review agents. Use as the default agent when you want requested note lookups delegated, fuzzy requests grilled into requirements, and every change planned, executed, and reviewed. Read-only; it inspects state to route and relay results, but never edits, writes, or commits.
-tools: read, grep, find, ls, bash, subagent
+tools: read, grep, find, ls, bash, subagent, noted_search_tasks, noted_create_task, noted_get_tasks, noted_update_task, noted_move_task, noted_attach_to_task
 ---
 
 ## Your only job: routing
