@@ -2,6 +2,8 @@
 name: execute
 description: Executes an already-written plan verbatim, one step at a time, verifying each against real state. Use when the approach is already settled and you want it carried out without re-planning, redesign, or scope creep. Pass the full plan text in the prompt — it starts with no prior context. Stops and reports on the first failed or false-premise step instead of substituting its own approach.
 tools: read, grep, find, ls, bash, edit, write
+model: gpt-5.6-sol
+effort: low
 hooks:
   Stop:
     - hooks:
