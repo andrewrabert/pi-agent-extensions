@@ -284,7 +284,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				const assistant = finalAssistant(sessionManager.buildSessionContext().messages);
 				const state: ChildState =
 					assistant?.stopReason === "error" || assistant?.stopReason === "aborted" ? "failed" : "completed";
-				children.set(sessionManager.getSessionId(), {
+				const handle: ChildHandle = {
 					...metadata,
 					id: sessionManager.getSessionId(),
 					sessionFile,
@@ -293,7 +293,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					queue: [],
 					stopRequested: false,
 					closing: false,
-				});
+				};
+				children.set(handle.id, handle);
 			} catch {
 				// Ignore unrelated or incomplete files in the private child directory.
 			}
@@ -314,14 +315,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		} catch {
 			// The worker reports its own failure before settling.
 		}
-		if (!handle.session) return;
-		try {
-			await handle.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-		} catch {
-			// Best-effort shutdown; dispose below is unconditional.
+		if (handle.session) {
+			try {
+				await handle.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+			} catch {
+				// Best-effort shutdown; dispose below is unconditional.
+			}
+			handle.session.dispose();
+			handle.session = undefined;
 		}
-		handle.session.dispose();
-		handle.session = undefined;
+		handle.state = "stopped";
 	};
 
 	pi.registerTool({
@@ -405,6 +408,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					runQueue(handle, ctx);
 				}
 			} else {
+				handle.state = "running";
 				handle.queue.push(params.message);
 				runQueue(handle, ctx);
 			}
@@ -588,6 +592,75 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(errorText(error), "error");
 			}
 		}),
+	});
+
+	pi.registerCommand("subagents", {
+		description: "Open a running subagent in a new tmux pane",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") return;
+			if (!process.env.TMUX) {
+				ctx.ui.notify("/subagents requires tmux", "error");
+				return;
+			}
+			const running = Array.from(children.values()).filter((handle) => handle.state === "running");
+			if (running.length === 0) {
+				ctx.ui.notify("No running subagents.", "info");
+				return;
+			}
+
+			const items: SelectItem[] = running.map((handle) => ({
+				value: handle.id,
+				label: `${handle.agent}  ${handle.id.slice(0, 8)}…`,
+			}));
+
+			const selected = await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
+				const container = new Container();
+				container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+				container.addChild(new Text(theme.fg("accent", theme.bold("Open running subagent in tmux"))));
+				const selectList = new SelectList(items, Math.min(items.length, 12), {
+					selectedPrefix: (text) => theme.fg("accent", text),
+					selectedText: (text) => theme.fg("accent", text),
+					description: (text) => theme.fg("muted", text),
+					scrollInfo: (text) => theme.fg("dim", text),
+					noMatch: (text) => theme.fg("warning", text),
+				});
+				selectList.onSelect = (item) => done(item.value);
+				selectList.onCancel = () => done(null);
+				container.addChild(selectList);
+				return {
+					render: (width: number) => container.render(width),
+					invalidate: () => container.invalidate(),
+					handleInput: (data: string) => {
+						selectList.handleInput(data);
+						tui.requestRender();
+					},
+				};
+			});
+			if (!selected) return;
+
+			const handle = children.get(selected);
+			if (!handle || handle.state !== "running") {
+				ctx.ui.notify("That subagent is no longer running.", "info");
+				return;
+			}
+
+			await closeChild(handle);
+			const result = await pi.exec("tmux", [
+				"split-window",
+				"-h",
+				"-c",
+				handle.cwd,
+				"--",
+				"pi",
+				"--session",
+				handle.sessionFile,
+				"--agent",
+				handle.agent,
+			]);
+			if (result.code !== 0) {
+				ctx.ui.notify(result.stderr.trim() || "Failed to open tmux pane", "error");
+			}
+		},
 	});
 
 	pi.registerShortcut("alt+o", {
