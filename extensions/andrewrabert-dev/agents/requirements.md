@@ -69,6 +69,9 @@ problem title.
 - <decision the interview settled: the question and the chosen answer, one line>
 ````
 
+Group requirements under `###` subheadings by domain concept; never emit a flat
+requirements list. Keep requirements concise and free of commentary.
+
 Every requirement is a fact someone could check, not an activity. No hedges —
 no may, might, should consider, TBD. No open questions: an open question in the
 note means the frontier was not empty and you stopped too early.
