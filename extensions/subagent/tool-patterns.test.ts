@@ -22,6 +22,14 @@ test("combines exact names and patterns without duplicates", () => {
 	});
 });
 
+test("expands the agent grant to every subagent lifecycle tool", () => {
+	const tools = ["read", "subagent", "subagent_send", "subagent_stop", "bash"];
+	assert.deepEqual(resolveToolPatterns(["agent"], tools), {
+		tools: ["subagent", "subagent_send", "subagent_stop"],
+		unmatched: [],
+	});
+});
+
 test("reports exact names and patterns that match no registered tool", () => {
 	assert.deepEqual(resolveToolPatterns(["write", "missing_*"], available), {
 		tools: [],

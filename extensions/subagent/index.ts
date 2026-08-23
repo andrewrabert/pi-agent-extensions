@@ -1,51 +1,54 @@
-/**
- * Subagent Tool - Delegate tasks to specialized agents
- *
- * Spawns a separate `pi` process for each subagent invocation,
- * giving it an isolated context window.
- *
- * Supports three modes:
- *   - Single: { agent: "name", task: "..." }
- *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
- *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
- *
- * Uses JSON mode to capture structured output from subagents.
- */
-
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
-import { StringEnum } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
-	CONFIG_DIR_NAME,
+	DefaultResourceLoader,
 	DynamicBorder,
 	type ExtensionAPI,
 	type ExtensionContext,
 	getAgentDir,
-	getMarkdownTheme,
-	withFileMutationQueue,
+	SessionManager,
+	SettingsManager,
+	createAgentSession,
+	type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
-	Markdown,
 	type SelectItem,
 	SelectList,
-	Spacer,
 	Text,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents, registerPackageAgentDir } from "./agents.ts";
+import { type AgentConfig, discoverAgents, registerPackageAgentDir } from "./agents.ts";
 import { resolveToolPatterns } from "./tool-patterns.ts";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
-const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const CHILD_METADATA_TYPE = "subagent-session";
+
+type ChildState = "running" | "completed" | "failed" | "stopped";
+
+type ChildMetadata = {
+	agent: string;
+	cwd: string;
+};
+
+type ChildHandle = ChildMetadata & {
+	id: string;
+	sessionFile: string;
+	sessionManager: SessionManager;
+	session?: AgentSession;
+	state: ChildState;
+	queue: string[];
+	worker?: Promise<void>;
+	stopRequested: boolean;
+	closing: boolean;
+};
+
+type AsyncSubagentEvent =
+	| { type: "subagent_completed"; agentId: string; output: string }
+	| { type: "subagent_failed"; agentId: string; error: string };
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -54,445 +57,82 @@ function formatTokens(count: number): string {
 	return `${(count / 1000000).toFixed(1)}M`;
 }
 
-function formatUsageStats(
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens?: number;
-		turns?: number;
-	},
-	model?: string,
-): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) {
-		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
+function childSessionDir(parentFile: string, parentId: string): string {
+	return path.join(path.dirname(parentFile), parentId);
+}
+
+function createChildSessionManager(
+	cwd: string,
+	dir: string,
+	parentFile: string,
+	metadata: ChildMetadata,
+): SessionManager {
+	const initial = SessionManager.create(cwd, dir, { parentSession: parentFile });
+	initial.appendCustomEntry(CHILD_METADATA_TYPE, metadata);
+	const sessionFile = initial.getSessionFile();
+	const header = initial.getHeader();
+	if (!sessionFile || !header) throw new Error("Failed to create persistent child session");
+
+	// SessionManager normally waits for the first assistant response before creating
+	// the file. Persist the identity and metadata now so a failed startup remains
+	// resumable/discoverable, then reopen to synchronize SessionManager's flush state.
+	const jsonl = [header, ...initial.getEntries()].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+	fs.writeFileSync(sessionFile, jsonl, { encoding: "utf8", flag: "wx", mode: 0o600 });
+	return SessionManager.open(sessionFile, dir);
+}
+
+function childMetadata(sessionManager: SessionManager): ChildMetadata | undefined {
+	for (const entry of sessionManager.getEntries().toReversed()) {
+		if (entry.type !== "custom" || entry.customType !== CHILD_METADATA_TYPE) continue;
+		const data = entry.data;
+		if (!data || typeof data !== "object") return undefined;
+		const agent = "agent" in data ? data.agent : undefined;
+		const cwd = "cwd" in data ? data.cwd : undefined;
+		if (typeof agent === "string" && typeof cwd === "string") return { agent, cwd };
+		return undefined;
 	}
-	if (model) parts.push(model);
-	return parts.join(" ");
+	return undefined;
 }
 
-function formatToolCall(
-	toolName: string,
-	args: Record<string, unknown>,
-	themeFg: (color: any, text: string) => string,
-): string {
-	const shortenPath = (p: string) => {
-		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-	};
-
-	switch (toolName) {
-		case "bash": {
-			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
-			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
-		}
-		case "read": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const offset = args.offset as number | undefined;
-			const limit = args.limit as number | undefined;
-			let text = themeFg("accent", filePath);
-			if (offset !== undefined || limit !== undefined) {
-				const startLine = offset ?? 1;
-				const endLine = limit !== undefined ? startLine + limit - 1 : "";
-				text += themeFg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
-			}
-			return themeFg("muted", "read ") + text;
-		}
-		case "write": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const content = (args.content || "") as string;
-			const lines = content.split("\n").length;
-			let text = themeFg("muted", "write ") + themeFg("accent", filePath);
-			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
-			return text;
-		}
-		case "edit": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "ls": {
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "find": {
-			const pattern = (args.pattern || "*") as string;
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
-		}
-		case "grep": {
-			const pattern = (args.pattern || "") as string;
-			const rawPath = (args.path || ".") as string;
-			return (
-				themeFg("muted", "grep ") +
-				themeFg("accent", `/${pattern}/`) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
-		}
-		default: {
-			const argsStr = JSON.stringify(args);
-			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
-			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
-		}
+function finalAssistant(messages: AgentMessage[]): Extract<AgentMessage, { role: "assistant" }> | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role === "assistant") return message;
 	}
+	return undefined;
 }
 
-interface UsageStats {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	contextTokens: number;
-	turns: number;
+function assistantText(message: Extract<AgentMessage, { role: "assistant" }> | undefined): string {
+	if (!message) return "";
+	return message.content
+		.filter((part): part is Extract<(typeof message.content)[number], { type: "text" }> => part.type === "text")
+		.map((part) => part.text)
+		.join("\n");
 }
 
-interface SingleResult {
-	agent: string;
-	agentSource: "user" | "project" | "unknown";
-	task: string;
-	exitCode: number;
-	messages: Message[];
-	stderr: string;
-	usage: UsageStats;
-	model?: string;
-	stopReason?: string;
-	errorMessage?: string;
-	step?: number;
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
-
-interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
-	agentScope: AgentScope;
-	projectAgentsDir: string | null;
-	results: SingleResult[];
-}
-
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
-function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-}
-
-function getResultOutput(result: SingleResult): string {
-	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-	}
-	return getFinalOutput(result.messages) || "(no output)";
-}
-
-function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
-}
-
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
-
-function getDisplayItems(messages: Message[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	for (const msg of messages) {
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
-			}
-		}
-	}
-	return items;
-}
-
-async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
-}
-
-async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	});
-	return { dir: tmpDir, filePath };
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-
-	return { command: "pi", args };
-}
-
-type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
-
-async function runSingleAgent(
-	defaultCwd: string,
-	agents: AgentConfig[],
-	availableTools: string[],
-	agentName: string,
-	task: string,
-	cwd: string | undefined,
-	step: number | undefined,
-	signal: AbortSignal | undefined,
-	onUpdate: OnUpdateCallback | undefined,
-	makeDetails: (results: SingleResult[]) => SubagentDetails,
-): Promise<SingleResult> {
-	const agent = agents.find((a) => a.name === agentName);
-
-	if (!agent) {
-		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-		return {
-			agent: agentName,
-			agentSource: "unknown",
-			task,
-			exitCode: 1,
-			messages: [],
-			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-			step,
-		};
-	}
-
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (agent.model) args.push("--model", agent.model);
-	if (agent.tools) {
-		const resolution = resolveToolPatterns(agent.tools, availableTools);
-		if (resolution.unmatched.length > 0) {
-			return {
-				agent: agentName,
-				agentSource: agent.source,
-				task,
-				exitCode: 1,
-				messages: [],
-				stderr: `Agent "${agent.name}" requires unavailable tools or patterns: ${resolution.unmatched.join(", ")}`,
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-				model: agent.model,
-				step,
-			};
-		}
-		if (resolution.tools.length > 0) args.push("--tools", resolution.tools.join(","));
-		else args.push("--no-tools");
-	}
-
-	let tmpPromptDir: string | null = null;
-	let tmpPromptPath: string | null = null;
-
-	const currentResult: SingleResult = {
-		agent: agentName,
-		agentSource: agent.source,
-		task,
-		exitCode: 0,
-		messages: [],
-		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
-		step,
-	};
-
-	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
-		}
-	};
-
-	try {
-		if (agent.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
-		}
-
-		args.push(`Task: ${task}`);
-		let wasAborted = false;
-
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			let buffer = "";
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				resolve(1);
-			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
-		});
-
-		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
-		return currentResult;
-	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
-	}
-}
-
-const TaskItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task to delegate to the agent" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-});
-
-const ChainItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-});
-
-const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	description: 'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
-	default: "user",
-});
-
-const firstSentence = (description: string): string =>
-	description.trim().match(/^[\s\S]*?[.!?](?=\s|$)/)?.[0] ?? description.trim();
 
 const SubagentParams = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
-	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
-	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
-	),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	agent: Type.String({ description: "Name of the agent to start." }),
+	prompt: Type.String({ description: "Initial instruction for the agent." }),
 });
 
-export default function (pi: ExtensionAPI) {
+const SubagentSendParams = Type.Object({
+	to: Type.String({ description: "Agent ID." }),
+	message: Type.String({ description: "Message for the agent." }),
+});
+
+const SubagentStopParams = Type.Object({
+	to: Type.String({ description: "Agent ID." }),
+});
+
+export default function subagentExtension(pi: ExtensionAPI) {
 	let mainAgent: AgentConfig | undefined;
 	let toolsBeforeMainAgent: string[] | undefined;
+	const children = new Map<string, ChildHandle>();
+
 	const unregisterPackageAgentPathListener = pi.events.on(
 		"subagent:register-agent-path",
 		(data: unknown) => {
@@ -501,10 +141,335 @@ export default function (pi: ExtensionAPI) {
 		},
 	);
 
+	const requireParent = (ctx: ExtensionContext): { file: string; id: string; dir: string } => {
+		const file = ctx.sessionManager.getSessionFile();
+		if (!file) throw new Error("Persistent subagents require a persisted parent session");
+		const id = ctx.sessionManager.getSessionId();
+		return { file, id, dir: childSessionDir(file, id) };
+	};
+
+	const emitAsyncEvent = (event: AsyncSubagentEvent): void => {
+		try {
+			pi.sendMessage(
+				{
+					customType: event.type,
+					content: JSON.stringify([event]),
+					display: true,
+					details: event,
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		} catch {
+			// The parent may have switched sessions while a child was finishing.
+		}
+	};
+
+	const resolveAgent = (handle: ChildHandle): AgentConfig => {
+		const agent = discoverAgents(handle.cwd, "user").agents.find((candidate) => candidate.name === handle.agent);
+		if (!agent) throw new Error(`Unknown agent: "${handle.agent}"`);
+		return agent;
+	};
+
+	const openChildSession = async (handle: ChildHandle, ctx: ExtensionContext): Promise<AgentSession> => {
+		if (handle.session) return handle.session;
+		const agent = resolveAgent(handle);
+		const availableTools = pi.getAllTools().map((tool) => tool.name);
+		const resolution = agent.tools ? resolveToolPatterns(agent.tools, availableTools) : undefined;
+		if (resolution && resolution.unmatched.length > 0) {
+			throw new Error(
+				`Agent "${agent.name}" requires unavailable tools or patterns: ${resolution.unmatched.join(", ")}`,
+			);
+		}
+
+		const settingsManager = SettingsManager.create(handle.cwd, getAgentDir());
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: handle.cwd,
+			agentDir: getAgentDir(),
+			settingsManager,
+			appendSystemPrompt: agent.systemPrompt.trim() ? [agent.systemPrompt] : [],
+		});
+		await resourceLoader.reload();
+
+		let model;
+		if (handle.sessionManager.getEntries().every((entry) => entry.type !== "model_change") && agent.model) {
+			const separator = agent.model.indexOf("/");
+			model =
+				separator > 0
+					? ctx.modelRegistry.find(agent.model.slice(0, separator), agent.model.slice(separator + 1))
+					: ctx.modelRegistry.getAvailable().find((candidate) => candidate.id === agent.model);
+			if (!model) throw new Error(`Agent "${agent.name}" model not found: ${agent.model}`);
+		}
+
+		const { session } = await createAgentSession({
+			cwd: handle.cwd,
+			agentDir: getAgentDir(),
+			model,
+			tools: resolution?.tools,
+			resourceLoader,
+			sessionManager: handle.sessionManager,
+			settingsManager,
+		});
+		await session.bindExtensions({ mode: "print" });
+		handle.session = session;
+		return session;
+	};
+
+	const runQueue = (handle: ChildHandle, ctx: ExtensionContext): void => {
+		if (handle.worker || handle.closing) return;
+		handle.worker = (async () => {
+			try {
+				const session = await openChildSession(handle, ctx);
+				while (handle.queue.length > 0) {
+					const prompt = handle.queue.shift()!;
+					handle.state = "running";
+					handle.stopRequested = false;
+					try {
+						await session.prompt(prompt);
+						if (handle.stopRequested) {
+							handle.state = "stopped";
+							continue;
+						}
+						const assistant = finalAssistant(session.messages);
+						if (assistant?.stopReason === "error" || assistant?.stopReason === "aborted") {
+							handle.state = "failed";
+							handle.queue.length = 0;
+							emitAsyncEvent({
+								type: "subagent_failed",
+								agentId: handle.id,
+								error: assistant.errorMessage || `Agent stopped: ${assistant.stopReason}`,
+							});
+							continue;
+						}
+						handle.state = "completed";
+						emitAsyncEvent({
+							type: "subagent_completed",
+							agentId: handle.id,
+							output: assistantText(assistant) || "(no output)",
+						});
+					} catch (error) {
+						if (handle.stopRequested) {
+							handle.state = "stopped";
+							continue;
+						}
+						handle.state = "failed";
+						handle.queue.length = 0;
+						emitAsyncEvent({ type: "subagent_failed", agentId: handle.id, error: errorText(error) });
+					}
+				}
+			} catch (error) {
+				handle.state = "failed";
+				handle.queue.length = 0;
+				emitAsyncEvent({ type: "subagent_failed", agentId: handle.id, error: errorText(error) });
+			} finally {
+				handle.worker = undefined;
+			}
+		})();
+	};
+
+	const restoreChildren = (ctx: ExtensionContext): void => {
+		children.clear();
+		const parentFile = ctx.sessionManager.getSessionFile();
+		if (!parentFile) return;
+		const dir = childSessionDir(parentFile, ctx.sessionManager.getSessionId());
+		if (!fs.existsSync(dir)) return;
+
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+			const sessionFile = path.join(dir, entry.name);
+			try {
+				const sessionManager = SessionManager.open(sessionFile, dir);
+				if (sessionManager.getHeader()?.parentSession !== parentFile) continue;
+				const metadata = childMetadata(sessionManager);
+				if (!metadata) continue;
+				const assistant = finalAssistant(sessionManager.buildSessionContext().messages);
+				const state: ChildState =
+					assistant?.stopReason === "error" || assistant?.stopReason === "aborted" ? "failed" : "completed";
+				children.set(sessionManager.getSessionId(), {
+					...metadata,
+					id: sessionManager.getSessionId(),
+					sessionFile,
+					sessionManager,
+					state,
+					queue: [],
+					stopRequested: false,
+					closing: false,
+				});
+			} catch {
+				// Ignore unrelated or incomplete files in the private child directory.
+			}
+		}
+	};
+
+	const closeChild = async (handle: ChildHandle): Promise<void> => {
+		handle.closing = true;
+		handle.stopRequested = true;
+		handle.queue.length = 0;
+		try {
+			await handle.session?.abort();
+		} catch {
+			// Continue shutdown even if abort hooks fail.
+		}
+		try {
+			await handle.worker;
+		} catch {
+			// The worker reports its own failure before settling.
+		}
+		if (!handle.session) return;
+		try {
+			await handle.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+		} catch {
+			// Best-effort shutdown; dispose below is unconditional.
+		}
+		handle.session.dispose();
+		handle.session = undefined;
+	};
+
+	pi.registerTool({
+		name: "subagent",
+		label: "Subagent",
+		description: "Start a persistent background subagent. Returns its Pi-generated agentId immediately; completion or failure arrives later as an asynchronous context message. Use subagent_send with that agentId to continue the same conversation and subagent_stop to abort its current run.",
+		promptSnippet: "Start a persistent background agent and receive its result asynchronously",
+		promptGuidelines: [
+			"Use subagent to start specialized background work. Keep its returned agentId when the conversation may need to continue.",
+			"Subagent completion and failure arrive asynchronously; do not treat the immediate start response as the agent's final output.",
+		],
+		parameters: SubagentParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const parent = requireParent(ctx);
+			const agent = discoverAgents(ctx.cwd, "user").agents.find((candidate) => candidate.name === params.agent);
+			if (!agent) {
+				const available = discoverAgents(ctx.cwd, "user").agents.map((candidate) => candidate.name).join(", ") || "none";
+				throw new Error(`Unknown agent: "${params.agent}". Available agents: ${available}`);
+			}
+
+			const sessionManager = createChildSessionManager(ctx.cwd, parent.dir, parent.file, {
+				agent: agent.name,
+				cwd: ctx.cwd,
+			});
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Failed to create persistent child session");
+
+			const handle: ChildHandle = {
+				id: sessionManager.getSessionId(),
+				agent: agent.name,
+				cwd: ctx.cwd,
+				sessionFile,
+				sessionManager,
+				state: "running",
+				queue: [params.prompt],
+				stopRequested: false,
+				closing: false,
+			};
+			children.set(handle.id, handle);
+			runQueue(handle, ctx);
+			return {
+				content: [{ type: "text", text: JSON.stringify({ agentId: handle.id }) }],
+				details: { agentId: handle.id, sessionFile },
+			};
+		},
+		renderCall(args, theme) {
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", args.agent)}\n  ${theme.fg("dim", args.prompt)}`,
+				0,
+				0,
+			);
+		},
+		renderResult(result, _options, theme) {
+			const details = result.details as { agentId?: string } | undefined;
+			return new Text(theme.fg("muted", details?.agentId ? `started ${details.agentId}` : "failed to start"), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_send",
+		label: "Subagent Send",
+		description: "Continue an existing persistent subagent conversation by sending a message to its Pi-generated agentId. A running agent is steered; a completed agent starts another run. The next completion or failure arrives asynchronously.",
+		promptSnippet: "Continue a running or completed subagent by agentId",
+		promptGuidelines: [
+			"Use subagent_send with the original agentId when follow-up work needs the same subagent context; do not start a replacement agent.",
+		],
+		parameters: SubagentSendParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			requireParent(ctx);
+			const handle = children.get(params.to);
+			if (!handle) throw new Error(`Unknown subagent: ${params.to}`);
+			if (handle.state !== "running" && handle.state !== "completed") {
+				throw new Error(`Subagent is ${handle.state}: ${params.to}`);
+			}
+			if (handle.state === "running" && handle.session?.isStreaming) {
+				try {
+					await handle.session.steer(params.message);
+				} catch {
+					// The run may have settled between the state check and steer.
+					handle.queue.push(params.message);
+					runQueue(handle, ctx);
+				}
+			} else {
+				handle.queue.push(params.message);
+				runQueue(handle, ctx);
+			}
+			return {
+				content: [{ type: "text", text: JSON.stringify({ agentId: handle.id }) }],
+				details: { agentId: handle.id, sessionFile: handle.sessionFile },
+			};
+		},
+		renderCall(args, theme) {
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("subagent_send "))}${theme.fg("accent", args.to)}\n  ${theme.fg("dim", args.message)}`,
+				0,
+				0,
+			);
+		},
+		renderResult(result, _options, theme) {
+			const details = result.details as { agentId?: string } | undefined;
+			return new Text(theme.fg("muted", details?.agentId ? `sent to ${details.agentId}` : "send failed"), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_stop",
+		label: "Subagent Stop",
+		description: "Abort a persistent subagent's current run by its Pi-generated agentId. Its transcript remains stored, but a stopped run cannot be continued with subagent_send.",
+		promptSnippet: "Abort a subagent's current run by agentId",
+		promptGuidelines: ["Use subagent_stop only to abort work that should no longer continue."],
+		parameters: SubagentStopParams,
+		async execute(_toolCallId, params) {
+			const handle = children.get(params.to);
+			if (!handle) throw new Error(`Unknown subagent: ${params.to}`);
+			if (handle.state === "running") {
+				handle.stopRequested = true;
+				handle.queue.length = 0;
+				await handle.session?.abort();
+				handle.state = "stopped";
+			}
+			return {
+				content: [{ type: "text", text: JSON.stringify({ agentId: handle.id }) }],
+				details: { agentId: handle.id, sessionFile: handle.sessionFile },
+			};
+		},
+		renderCall(args, theme) {
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("subagent_stop "))}${theme.fg("accent", args.to)}`,
+				0,
+				0,
+			);
+		},
+		renderResult(result, _options, theme) {
+			const details = result.details as { agentId?: string } | undefined;
+			return new Text(theme.fg("muted", details?.agentId ? `stopped ${details.agentId}` : "stop failed"), 0, 0);
+		},
+	});
+
+	pi.registerMessageRenderer("subagent_completed", (message, _options, theme) =>
+		new Text(theme.fg("success", message.content as string), 0, 0),
+	);
+	pi.registerMessageRenderer("subagent_failed", (message, _options, theme) =>
+		new Text(theme.fg("error", message.content as string), 0, 0),
+	);
+
 	const installAgentFooter = (ctx: ExtensionContext) => {
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
-
 			return {
 				dispose: unsubscribe,
 				invalidate() {},
@@ -517,85 +482,46 @@ export default function (pi: ExtensionAPI) {
 					}
 					const sessionName = ctx.sessionManager.getSessionName();
 					if (sessionName) pwd += ` • ${sessionName}`;
-
-					const agent = mainAgent
-						? truncateToWidth(theme.bg("selectedBg", ` ${mainAgent.name} `), width, "")
-						: "";
+					const agent = mainAgent ? truncateToWidth(theme.bg("selectedBg", ` ${mainAgent.name} `), width, "") : "";
 					const availablePwd = Math.max(0, width - visibleWidth(agent) - (agent ? 1 : 0));
-					const displayedPwd = availablePwd
-						? truncateToWidth(theme.fg("dim", pwd), availablePwd, theme.fg("dim", "..."))
-						: "";
-					const agentPadding = " ".repeat(Math.max(0, width - visibleWidth(displayedPwd) - visibleWidth(agent)));
-
+					const displayedPwd = availablePwd ? truncateToWidth(theme.fg("dim", pwd), availablePwd, theme.fg("dim", "...")) : "";
+					const padding = " ".repeat(Math.max(0, width - visibleWidth(displayedPwd) - visibleWidth(agent)));
 					const context = ctx.getContextUsage();
 					const contextWindow = context?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-					const percent = context?.percent;
-					const contextText = `${context ? formatTokens(context.tokens) : "?"}/${formatTokens(contextWindow)}`;
-					let left =
-						percent !== null && percent !== undefined && percent > 90
-							? theme.fg("error", contextText)
-							: percent !== null && percent !== undefined && percent > 70
-								? theme.fg("warning", contextText)
-								: contextText;
+					const left = `${context?.tokens != null ? formatTokens(context.tokens) : "?"}/${formatTokens(contextWindow)}`;
 					const modelName = ctx.model?.id ?? "no-model";
-					const right = ctx.model?.reasoning
-						? `${modelName} • ${ctx.thinkingLevel === "off" ? "thinking off" : ctx.thinkingLevel}`
-						: modelName;
-					const availableLeft = Math.max(0, width - visibleWidth(right) - 2);
-					left = truncateToWidth(left, availableLeft || width, "...");
-					const padding = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-					const lines = [
-						truncateToWidth(displayedPwd + agentPadding + agent, width),
-						truncateToWidth(theme.fg("dim", left + padding + right), width),
+					const right = ctx.model?.reasoning ? `${modelName} • ${ctx.thinkingLevel === "off" ? "thinking off" : ctx.thinkingLevel}` : modelName;
+					const statusPadding = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
+					return [
+						truncateToWidth(displayedPwd + padding + agent, width),
+						truncateToWidth(theme.fg("dim", left + statusPadding + right), width),
 					];
-
-					const otherStatuses = Array.from(footerData.getExtensionStatuses().entries())
-						.filter(([id]) => id !== "main-agent")
-						.sort(([a], [b]) => a.localeCompare(b))
-						.map(([, text]) => text.replace(/[\r\n\t]+/g, " ").replace(/ +/g, " ").trim());
-					if (otherStatuses.length > 0) lines.push(truncateToWidth(otherStatuses.join(" "), width));
-					return lines;
 				},
 			};
 		});
 	};
 
 	const activateMainAgent = async (agent: AgentConfig, ctx: ExtensionContext) => {
-		if (!agent.tools) {
-			throw new Error(`Main agent "${agent.name}" must declare a tools allowlist or tools: none`);
-		}
-
-		const resolution = resolveToolPatterns(
-			agent.tools,
-			pi.getAllTools().map((tool) => tool.name),
-		);
+		if (!agent.tools) throw new Error(`Main agent "${agent.name}" must declare a tools allowlist or tools: none`);
+		const resolution = resolveToolPatterns(agent.tools, pi.getAllTools().map((tool) => tool.name));
 		if (resolution.unmatched.length > 0) {
-			throw new Error(
-				`Main agent "${agent.name}" requires unavailable tools or patterns: ${resolution.unmatched.join(", ")}`,
-			);
+			throw new Error(`Main agent "${agent.name}" requires unavailable tools or patterns: ${resolution.unmatched.join(", ")}`);
 		}
-
 		if (agent.model) {
 			const separator = agent.model.indexOf("/");
-			const model =
-				separator > 0
-					? ctx.modelRegistry.find(agent.model.slice(0, separator), agent.model.slice(separator + 1))
-					: ctx.modelRegistry.getAvailable().find((candidate) => candidate.id === agent.model);
-			if (!model) {
-				throw new Error(`Main agent "${agent.name}" model not found: ${agent.model}`);
-			}
-			if (!(await pi.setModel(model))) {
-				throw new Error(`Main agent "${agent.name}" model is unavailable: ${agent.model}`);
-			}
+			const model = separator > 0
+				? ctx.modelRegistry.find(agent.model.slice(0, separator), agent.model.slice(separator + 1))
+				: ctx.modelRegistry.getAvailable().find((candidate) => candidate.id === agent.model);
+			if (!model) throw new Error(`Main agent "${agent.name}" model not found: ${agent.model}`);
+			if (!(await pi.setModel(model))) throw new Error(`Main agent "${agent.name}" model is unavailable: ${agent.model}`);
 		}
-
 		toolsBeforeMainAgent ??= pi.getActiveTools();
 		mainAgent = agent;
 		pi.setActiveTools(resolution.tools);
 		ctx.ui.setStatus("main-agent", `agent:${agent.name}`);
 	};
 
-	const deactivateMainAgent = (ctx: { ui: { setStatus: (id: string, text: string | undefined) => void } }) => {
+	const deactivateMainAgent = (ctx: ExtensionContext) => {
 		mainAgent = undefined;
 		if (toolsBeforeMainAgent) pi.setActiveTools(toolsBeforeMainAgent);
 		ctx.ui.setStatus("main-agent", undefined);
@@ -607,47 +533,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	let handleAgentCommand!: (args: string, ctx: ExtensionContext) => Promise<void>;
-
 	pi.registerCommand("agent", {
 		description: "Switch or unload the main pi agent for the current session",
-		getArgumentCompletions: (prefix) => {
-			const matches = discoverAgents(process.cwd(), "user").agents
-				.sort((a, b) => a.name.localeCompare(b.name))
-				.filter((agent) => agent.name.startsWith(prefix))
-				.map((agent) => ({ value: agent.name, label: agent.name, description: firstSentence(agent.description) }));
-			if ("default".startsWith(prefix)) {
-				matches.unshift({ value: "default", label: "default", description: "Use pi without a main agent." });
-			}
-			return matches.length > 0 ? matches : null;
-		},
 		handler: (handleAgentCommand = async (args, ctx) => {
 			const agents = discoverAgents(ctx.cwd, "user").agents.sort((a, b) => a.name.localeCompare(b.name));
 			let name = args.trim();
-
 			if (!name) {
 				const selected = await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
-					const highlight = (text: string) => theme.bg("selectedBg", theme.fg("accent", theme.bold(text)));
-					const defaultDescription = "Use pi without a main agent.";
 					const items: SelectItem[] = [
-						{
-							value: "default",
-							label: mainAgent ? "default" : highlight("default"),
-							description: mainAgent ? defaultDescription : highlight(defaultDescription),
-						},
-						...agents.map((agent) => {
-							const isActive = agent.name === mainAgent?.name;
-							const description = firstSentence(agent.description);
-							return {
-								value: agent.name,
-								label: isActive ? highlight(agent.name) : agent.name,
-								description: isActive ? highlight(description) : description,
-							};
-						}),
+						{ value: "default", label: "default", description: "Use pi without a main agent." },
+						...agents.map((agent) => ({ value: agent.name, label: agent.name, description: agent.description })),
 					];
 					const container = new Container();
 					container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
 					container.addChild(new Text(theme.fg("accent", theme.bold("Switch main agent"))));
-
 					const selectList = new SelectList(items, Math.min(items.length, 10), {
 						selectedPrefix: (text) => theme.fg("accent", text),
 						selectedText: (text) => theme.fg("accent", text),
@@ -655,39 +554,28 @@ export default function (pi: ExtensionAPI) {
 						scrollInfo: (text) => theme.fg("dim", text),
 						noMatch: (text) => theme.fg("warning", text),
 					});
-					const activeIndex = mainAgent ? items.findIndex((item) => item.value === mainAgent?.name) : 0;
-					selectList.setSelectedIndex(Math.max(0, activeIndex));
 					selectList.onSelect = (item) => done(item.value);
 					selectList.onCancel = () => done(null);
 					container.addChild(selectList);
-					container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter select • esc cancel")));
-					container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-
 					return {
 						render: (width: number) => container.render(width),
 						invalidate: () => container.invalidate(),
-						handleInput: (data: string) => {
-							selectList.handleInput(data);
-							tui.requestRender();
-						},
+						handleInput: (data: string) => { selectList.handleInput(data); tui.requestRender(); },
 					};
 				});
 				if (!selected) return;
 				name = selected;
 			}
-
 			if (name === "default") {
 				deactivateMainAgent(ctx);
 				ctx.ui.notify("Switched main agent to default", "info");
 				return;
 			}
-
 			const agent = agents.find((candidate) => candidate.name === name);
 			if (!agent) {
 				ctx.ui.notify(`Unknown user agent: "${name}"`, "error");
 				return;
 			}
-
 			try {
 				if (mainAgent?.name === agent.name) {
 					deactivateMainAgent(ctx);
@@ -697,7 +585,7 @@ export default function (pi: ExtensionAPI) {
 				await activateMainAgent(agent, ctx);
 				ctx.ui.notify(`Switched main agent to ${agent.name}`, "info");
 			} catch (error) {
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				ctx.ui.notify(errorText(error), "error");
 			}
 		}),
 	});
@@ -709,17 +597,14 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		installAgentFooter(ctx);
+		restoreChildren(ctx);
 		const requested = pi.getFlag("agent");
 		if (typeof requested !== "string" || !requested.trim()) {
 			deactivateMainAgent(ctx);
 			return;
 		}
-
-		const name = requested.trim();
-		const agent = discoverAgents(ctx.cwd, "user").agents.find((candidate) => candidate.name === name);
-		if (!agent) {
-			throw new Error(`Unknown user agent: "${name}"`);
-		}
+		const agent = discoverAgents(ctx.cwd, "user").agents.find((candidate) => candidate.name === requested.trim());
+		if (!agent) throw new Error(`Unknown user agent: "${requested.trim()}"`);
 		await activateMainAgent(agent, ctx);
 	});
 
@@ -730,568 +615,11 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		unregisterPackageAgentPathListener();
+		await Promise.all(Array.from(children.values(), closeChild));
+		children.clear();
 		ctx.ui.setStatus("main-agent", undefined);
 		ctx.ui.setFooter(undefined);
-	});
-
-	pi.registerTool({
-		name: "subagent",
-		label: "Subagent",
-		description: [
-			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			`Default agent scope is "user" (package agents plus ${path.join(getAgentDir(), "agents")}).`,
-			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
-		].join(" "),
-		parameters: SubagentParams,
-
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const agentScope: AgentScope = params.agentScope ?? "user";
-			const discovery = discoverAgents(ctx.cwd, agentScope);
-			const agents = discovery.agents;
-			const availableTools = pi.getAllTools().map((tool) => tool.name);
-			const confirmProjectAgents = params.confirmProjectAgents ?? true;
-
-			const hasChain = (params.chain?.length ?? 0) > 0;
-			const hasTasks = (params.tasks?.length ?? 0) > 0;
-			const hasSingle = Boolean(params.agent && params.task);
-			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
-
-			const makeDetails =
-				(mode: "single" | "parallel" | "chain") =>
-				(results: SingleResult[]): SubagentDetails => ({
-					mode,
-					agentScope,
-					projectAgentsDir: discovery.projectAgentsDir,
-					results,
-				});
-
-			if (modeCount !== 1) {
-				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
-						},
-					],
-					details: makeDetails("single")([]),
-				};
-			}
-
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
-				const requestedAgentNames = new Set<string>();
-				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
-				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
-				if (params.agent) requestedAgentNames.add(params.agent);
-
-				const projectAgentsRequested = Array.from(requestedAgentNames)
-					.map((name) => agents.find((a) => a.name === name))
-					.filter((a): a is AgentConfig => a?.source === "project");
-
-				if (projectAgentsRequested.length > 0) {
-					const names = projectAgentsRequested.map((a) => a.name).join(", ");
-					const dir = discovery.projectAgentsDir ?? "(unknown)";
-					const ok = await ctx.ui.confirm(
-						"Run project-local agents?",
-						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
-					);
-					if (!ok)
-						return {
-							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
-							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-						};
-				}
-			}
-
-			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
-
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
-
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						availableTools,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
-					results.push(result);
-
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
-					}
-					previousOutput = getFinalOutput(result.messages);
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
-				};
-			}
-
-			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: -1, // -1 = still running
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					};
-				}
-
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
-					}
-				};
-
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						availableTools,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
-
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const summaries = results.map((r) => {
-					const output = truncateParallelOutput(getResultOutput(r));
-					const status = isFailedResult(r)
-						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-						: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
-				});
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
-						},
-					],
-					details: makeDetails("parallel")(results),
-				};
-			}
-
-			if (params.agent && params.task) {
-				const result = await runSingleAgent(
-					ctx.cwd,
-					agents,
-					availableTools,
-					params.agent,
-					params.task,
-					params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-				);
-				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
-					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-						details: makeDetails("single")([result]),
-						isError: true,
-					};
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails("single")([result]),
-				};
-			}
-
-			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
-			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
-				details: makeDetails("single")([]),
-			};
-		},
-
-		renderCall(args, theme, _context) {
-			const scope: AgentScope = args.agentScope ?? "user";
-			if (args.chain && args.chain.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
-					text +=
-						"\n  " +
-						theme.fg("muted", `${i + 1}.`) +
-						" " +
-						theme.fg("accent", step.agent) +
-						theme.fg("dim", ` ${preview}`);
-				}
-				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
-			if (args.tasks && args.tasks.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (const t of args.tasks.slice(0, 3)) {
-					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
-					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
-				}
-				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
-			const agentName = args.agent || "...";
-			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
-			let text =
-				theme.fg("toolTitle", theme.bold("subagent ")) +
-				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`);
-			text += `\n  ${theme.fg("dim", preview)}`;
-			return new Text(text, 0, 0);
-		},
-
-		renderResult(result, { expanded }, theme, _context) {
-			const details = result.details as SubagentDetails | undefined;
-			if (!details || details.results.length === 0) {
-				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
-			}
-
-			const mdTheme = getMarkdownTheme();
-
-			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
-				const toShow = limit ? items.slice(-limit) : items;
-				const skipped = limit && items.length > limit ? items.length - limit : 0;
-				let text = "";
-				if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
-				for (const item of toShow) {
-					if (item.type === "text") {
-						const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
-						text += `${theme.fg("toolOutput", preview)}\n`;
-					} else {
-						text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
-					}
-				}
-				return text.trimEnd();
-			};
-
-			if (details.mode === "single" && details.results.length === 1) {
-				const r = details.results[0];
-				const isError = isFailedResult(r);
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-				const displayItems = getDisplayItems(r.messages);
-				const finalOutput = getFinalOutput(r.messages);
-
-				if (expanded) {
-					const container = new Container();
-					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-					container.addChild(new Text(header, 0, 0));
-					if (isError && r.errorMessage)
-						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
-					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
-					if (displayItems.length === 0 && !finalOutput) {
-						container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
-					} else {
-						for (const item of displayItems) {
-							if (item.type === "toolCall")
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-						}
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
-					}
-					const usageStr = formatUsageStats(r.usage, r.model);
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
-					}
-					return container;
-				}
-
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-				else {
-					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
-					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				}
-				const usageStr = formatUsageStats(r.usage, r.model);
-				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
-				return new Text(text, 0, 0);
-			}
-
-			const aggregateUsage = (results: SingleResult[]) => {
-				const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-				for (const r of results) {
-					total.input += r.usage.input;
-					total.output += r.usage.output;
-					total.cacheRead += r.usage.cacheRead;
-					total.cacheWrite += r.usage.cacheWrite;
-					total.cost += r.usage.cost;
-					total.turns += r.usage.turns;
-				}
-				return total;
-			};
-
-			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
-
-				if (expanded) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							icon +
-								" " +
-								theme.fg("toolTitle", theme.bold("chain ")) +
-								theme.fg("accent", `${successCount}/${details.results.length} steps`),
-							0,
-							0,
-						),
-					);
-
-					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-						const displayItems = getDisplayItems(r.messages);
-						const finalOutput = getFinalOutput(r.messages);
-
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(
-								`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}`,
-								0,
-								0,
-							),
-						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-							}
-						}
-
-						// Show final output as markdown
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
-
-						const stepUsage = formatUsageStats(r.usage, r.model);
-						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
-					}
-
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed view
-				let text =
-					icon +
-					" " +
-					theme.fg("toolTitle", theme.bold("chain ")) +
-					theme.fg("accent", `${successCount}/${details.results.length} steps`);
-				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
-				}
-				const usageStr = formatUsageStats(aggregateUsage(details.results));
-				if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
-				text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				return new Text(text, 0, 0);
-			}
-
-			if (details.mode === "parallel") {
-				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-				const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
-				const isRunning = running > 0;
-				const icon = isRunning
-					? theme.fg("warning", "⏳")
-					: failCount > 0
-						? theme.fg("warning", "◐")
-						: theme.fg("success", "✓");
-				const status = isRunning
-					? `${successCount + failCount}/${details.results.length} done, ${running} running`
-					: `${successCount}/${details.results.length} tasks`;
-
-				if (expanded && !isRunning) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
-							0,
-							0,
-						),
-					);
-
-					for (const r of details.results) {
-						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
-						const displayItems = getDisplayItems(r.messages);
-						const finalOutput = getFinalOutput(r.messages);
-
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
-						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-							}
-						}
-
-						// Show final output as markdown
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
-
-						const taskUsage = formatUsageStats(r.usage, r.model);
-						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
-					}
-
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed view (or still running)
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
-				for (const r of details.results) {
-					const rIcon =
-						r.exitCode === -1
-							? theme.fg("warning", "⏳")
-							: isFailedResult(r)
-								? theme.fg("error", "✗")
-								: theme.fg("success", "✓");
-					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0)
-						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
-				}
-				if (!isRunning) {
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
-				}
-				if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				return new Text(text, 0, 0);
-			}
-
-			const text = result.content[0];
-			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
-		},
 	});
 }
