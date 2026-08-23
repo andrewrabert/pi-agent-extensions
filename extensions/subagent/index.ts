@@ -14,6 +14,7 @@ import {
 	type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import {
+	Box,
 	Container,
 	type SelectItem,
 	SelectList,
@@ -464,12 +465,32 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerMessageRenderer("subagent_completed", (message, _options, theme) =>
-		new Text(theme.fg("success", message.content as string), 0, 0),
-	);
-	pi.registerMessageRenderer("subagent_failed", (message, _options, theme) =>
-		new Text(theme.fg("error", message.content as string), 0, 0),
-	);
+	pi.registerMessageRenderer("subagent_completed", (message, { outputPad }, theme) => {
+		const details = message.details as Extract<AsyncSubagentEvent, { type: "subagent_completed" }> | undefined;
+		const box = new Box(outputPad, 1, (text) => theme.bg("toolSuccessBg", text));
+		box.addChild(
+			new Text(
+				`${theme.fg("toolTitle", theme.bold("subagent_completed "))}${theme.fg("accent", details?.agentId ?? "unknown")}`,
+				0,
+				0,
+			),
+		);
+		box.addChild(new Text(theme.fg("toolOutput", details?.output ?? String(message.content)), 0, 0));
+		return box;
+	});
+	pi.registerMessageRenderer("subagent_failed", (message, { outputPad }, theme) => {
+		const details = message.details as Extract<AsyncSubagentEvent, { type: "subagent_failed" }> | undefined;
+		const box = new Box(outputPad, 1, (text) => theme.bg("toolErrorBg", text));
+		box.addChild(
+			new Text(
+				`${theme.fg("toolTitle", theme.bold("subagent_failed "))}${theme.fg("accent", details?.agentId ?? "unknown")}`,
+				0,
+				0,
+			),
+		);
+		box.addChild(new Text(theme.fg("error", details?.error ?? String(message.content)), 0, 0));
+		return box;
+	});
 
 	const installAgentFooter = (ctx: ExtensionContext) => {
 		ctx.ui.setFooter((tui, theme, footerData) => {
