@@ -33,6 +33,22 @@ function inheritedEnvironment(): Record<string, string> {
 	);
 }
 
+function isExecutableNotFoundError(error: unknown): boolean {
+	let current = error;
+	while (current && typeof current === "object") {
+		if ("code" in current && current.code === "ENOENT") return true;
+		if (
+			"message" in current &&
+			typeof current.message === "string" &&
+			current.message.startsWith("Executable not found in $PATH:")
+		) {
+			return true;
+		}
+		current = "cause" in current ? current.cause : undefined;
+	}
+	return false;
+}
+
 function piToolName(mcpName: string): string {
 	const snakeCase = mcpName
 		.replace(/([a-z0-9])([A-Z])/g, "$1_$2")
@@ -218,9 +234,9 @@ export default function notedMcpExtension(pi: ExtensionAPI) {
 			try {
 				await client.close();
 			} catch {
-				// Preserve the startup error.
 			}
-			throw error;
+			if (!isExecutableNotFoundError(error)) throw error;
+			ctx.ui.notify(`noted unavailable: "${COMMAND}" not found in $PATH`, "warning");
 		}
 	});
 
