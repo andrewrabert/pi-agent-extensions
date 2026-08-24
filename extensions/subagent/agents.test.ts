@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { discoverAgents, registerPackageAgentDir } from "./agents.ts";
+import { discoverAgents, formatAvailableAgentsPrompt, registerPackageAgentDir } from "./agents.ts";
 
 const agentMarkdown = (name: string, description: string) =>
 	`---\nname: ${name}\ndescription: ${description}\n---\n\nSystem prompt for ${name}.\n`;
@@ -41,4 +41,20 @@ test("project agents override package agents in both scope", () => {
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test("formats exact agent names, descriptions, and tools for the system prompt", () => {
+	const prompt = formatAvailableAgentsPrompt([
+		{
+			name: "research",
+			description: "Researches the web and notes",
+			tools: ["web_search", "noted_*"],
+			systemPrompt: "",
+			source: "package",
+			filePath: "/agents/research.md",
+		},
+	]);
+
+	assert.match(prompt, /one of these exact agent names/);
+	assert.match(prompt, /- research: Researches the web and notes \(tools: web_search, noted_\*\)/);
 });

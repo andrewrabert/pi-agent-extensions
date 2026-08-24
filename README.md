@@ -30,7 +30,9 @@ pi update --extensions
 
 The noted extension runs `noted server mcp` from `PATH`. Set `NOTED_COMMAND` to override the executable.
 
-The subagent extension accepts bundled agent directories through the shared `subagent:register-agent-path` event. Bundled agents have lower precedence than user agents in `~/.pi/agent/agents`, which in turn have lower precedence than project agents in `.pi/agents`.
+The subagent extension accepts bundled agent directories through the shared `subagent:register-agent-path` event. Bundled agents have lower precedence than user agents in `~/.pi/agent/agents`, which in turn have lower precedence than project agents in `.pi/agents`. Project agents are included only for trusted projects.
+
+At session startup, the extension snapshots the available agents and injects their exact names, descriptions, and tool grants into the system prompt. The `subagent` tool validates names against that same snapshot. Use `/reload` or start a new Pi process after changing agent definitions.
 
 Subagents use persistent SDK sessions. Their transcripts are stored in a directory named for the parent session ID beside the parent transcript, so they do not appear in `/resume`. The child session ID is also the public subagent ID used by `subagent_send` and `subagent_stop`.
 

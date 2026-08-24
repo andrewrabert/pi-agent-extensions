@@ -143,3 +143,16 @@ export function formatAgentList(agents: AgentConfig[], maxItems: number): { text
 		remaining,
 	};
 }
+
+export function formatAvailableAgentsPrompt(agents: AgentConfig[]): string {
+	const entries = agents.map((agent) => {
+		const tools = agent.tools === undefined ? "default" : agent.tools.length > 0 ? agent.tools.join(", ") : "none";
+		return `- ${agent.name}: ${agent.description} (tools: ${tools})`;
+	});
+	return [
+		"<available_subagents>",
+		"Use the subagent tool with one of these exact agent names. Do not invent or alter a name.",
+		...(entries.length > 0 ? entries : ["none"]),
+		"</available_subagents>",
+	].join("\n");
+}

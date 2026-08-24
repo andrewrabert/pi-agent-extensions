@@ -8,6 +8,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	getAgentDir,
+	type Theme,
 	SessionManager,
 	SettingsManager,
 	createAgentSession,
@@ -15,6 +16,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	Box,
+	type Component,
 	Container,
 	type SelectItem,
 	SelectList,
@@ -23,7 +25,12 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, discoverAgents, registerPackageAgentDir } from "./agents.ts";
+import {
+	type AgentConfig,
+	discoverAgents,
+	formatAvailableAgentsPrompt,
+	registerPackageAgentDir,
+} from "./agents.ts";
 import { resolveToolPatterns } from "./tool-patterns.ts";
 
 const CHILD_METADATA_TYPE = "subagent-session";
@@ -33,11 +40,13 @@ type ChildState = "running" | "completed" | "failed" | "stopped";
 type ChildMetadata = {
 	agent: string;
 	cwd: string;
+	description?: string;
 };
 
 type ChildHandle = ChildMetadata & {
 	id: string;
 	sessionFile: string;
+	runStartedAt?: number;
 	sessionManager: SessionManager;
 	session?: AgentSession;
 	state: ChildState;
@@ -48,8 +57,22 @@ type ChildHandle = ChildMetadata & {
 };
 
 type AsyncSubagentEvent =
-	| { type: "subagent_completed"; agentId: string; output: string }
-	| { type: "subagent_failed"; agentId: string; error: string };
+	| {
+			type: "subagent_completed";
+			agent: string;
+			agentId: string;
+			description?: string;
+			durationMs: number;
+			output: string;
+	  }
+	| {
+			type: "subagent_failed";
+			agent: string;
+			agentId: string;
+			description?: string;
+			durationMs: number;
+			error: string;
+	  };
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -69,6 +92,10 @@ function createChildSessionManager(
 	metadata: ChildMetadata,
 ): SessionManager {
 	const initial = SessionManager.create(cwd, dir, { parentSession: parentFile });
+	// Session selectors use the persisted session name as the label shown before
+	// the session ID. Keep the agent visible there instead of requiring users to
+	// identify child sessions from their prompts.
+	initial.appendSessionInfo(subagentLabel(metadata.agent, metadata.description));
 	initial.appendCustomEntry(CHILD_METADATA_TYPE, metadata);
 	const sessionFile = initial.getSessionFile();
 	const header = initial.getHeader();
@@ -89,8 +116,10 @@ function childMetadata(sessionManager: SessionManager): ChildMetadata | undefine
 		if (!data || typeof data !== "object") return undefined;
 		const agent = "agent" in data ? data.agent : undefined;
 		const cwd = "cwd" in data ? data.cwd : undefined;
-		if (typeof agent === "string" && typeof cwd === "string") return { agent, cwd };
-		return undefined;
+		const description = "description" in data ? data.description : undefined;
+		if (typeof agent !== "string" || typeof cwd !== "string") return undefined;
+		if (description !== undefined && typeof description !== "string") return undefined;
+		return { agent, cwd, description };
 	}
 	return undefined;
 }
@@ -115,8 +144,61 @@ function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function subagentLabel(agent: string, description?: string): string {
+	return description ? `${agent}: ${description}` : agent;
+}
+
+function styleSubagentAgent(agent: string, state: ChildState, theme: Theme): string {
+	return state === "completed"
+		? theme.fg("success", theme.bold(agent))
+		: state === "failed"
+			? theme.fg("error", theme.bold(agent))
+			: state === "stopped"
+				? theme.fg("warning", theme.bold(agent))
+				: theme.fg("text", theme.bold(agent));
+}
+
+function styleSubagentIdentity(
+	agent: string,
+	description: string | undefined,
+	state: ChildState,
+	theme: Theme,
+): string {
+	const quotedDescription = description ? ` "${description}"` : "";
+	return `${styleSubagentAgent(agent, state, theme)}${theme.fg("muted", quotedDescription)}`;
+}
+
+function renderSubagentRow(
+	renderText: (state: ChildState) => string,
+	theme: Theme,
+	paddingX = 1,
+	getState: () => ChildState = () => "running",
+): Component {
+	return {
+		render(width: number): string[] {
+			const state = getState();
+			const background = state === "failed" ? "toolErrorBg" : "toolSuccessBg";
+			const box = new Box(paddingX, 0, (text) => theme.bg(background, text));
+			box.addChild(new Text(renderText(state), 0, 0));
+			return box.render(width);
+		},
+		invalidate() {},
+	};
+}
+
+function formatDuration(durationMs: number): string {
+	const seconds = Math.max(0, Math.round(durationMs / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
 const SubagentParams = Type.Object({
-	agent: Type.String({ description: "Name of the agent to start." }),
+	agent: Type.String({ description: "Exact agent name from the available subagents listed in the system prompt." }),
+	description: Type.String({
+		description: "A short (3-5 word) description of the task",
+		minLength: 1,
+		pattern: "\\S",
+	}),
 	prompt: Type.String({ description: "Initial instruction for the agent." }),
 });
 
@@ -129,10 +211,24 @@ const SubagentStopParams = Type.Object({
 	to: Type.String({ description: "Agent ID." }),
 });
 
+type SubagentDisplayDetails = {
+	agent?: string;
+	agentId?: string;
+	description?: string;
+};
+
 export default function subagentExtension(pi: ExtensionAPI) {
 	let mainAgent: AgentConfig | undefined;
 	let toolsBeforeMainAgent: string[] | undefined;
+	let availableAgents = new Map<string, AgentConfig>();
+	let requestFooterRender: (() => void) | undefined;
 	const children = new Map<string, ChildHandle>();
+
+	const loadAvailableAgents = (ctx: ExtensionContext): void => {
+		const scope = ctx.isProjectTrusted() ? "both" : "user";
+		const agents = discoverAgents(ctx.cwd, scope).agents.sort((a, b) => a.name.localeCompare(b.name));
+		availableAgents = new Map(agents.map((agent) => [agent.name, agent]));
+	};
 
 	const unregisterPackageAgentPathListener = pi.events.on(
 		"subagent:register-agent-path",
@@ -150,6 +246,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	};
 
 	const emitAsyncEvent = (event: AsyncSubagentEvent): void => {
+		requestFooterRender?.();
 		try {
 			pi.sendMessage(
 				{
@@ -166,7 +263,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	};
 
 	const resolveAgent = (handle: ChildHandle): AgentConfig => {
-		const agent = discoverAgents(handle.cwd, "user").agents.find((candidate) => candidate.name === handle.agent);
+		const agent = availableAgents.get(handle.agent);
 		if (!agent) throw new Error(`Unknown agent: "${handle.agent}"`);
 		return agent;
 	};
@@ -222,12 +319,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				const session = await openChildSession(handle, ctx);
 				while (handle.queue.length > 0) {
 					const prompt = handle.queue.shift()!;
+					handle.runStartedAt ??= Date.now();
 					handle.state = "running";
 					handle.stopRequested = false;
 					try {
 						await session.prompt(prompt);
 						if (handle.stopRequested) {
 							handle.state = "stopped";
+							handle.runStartedAt = undefined;
 							continue;
 						}
 						const assistant = finalAssistant(session.messages);
@@ -236,31 +335,56 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							handle.queue.length = 0;
 							emitAsyncEvent({
 								type: "subagent_failed",
+								agent: handle.agent,
 								agentId: handle.id,
+								description: handle.description,
+								durationMs: Date.now() - (handle.runStartedAt ?? Date.now()),
 								error: assistant.errorMessage || `Agent stopped: ${assistant.stopReason}`,
 							});
+							handle.runStartedAt = undefined;
 							continue;
 						}
 						handle.state = "completed";
 						emitAsyncEvent({
 							type: "subagent_completed",
+							agent: handle.agent,
 							agentId: handle.id,
+							description: handle.description,
+							durationMs: Date.now() - (handle.runStartedAt ?? Date.now()),
 							output: assistantText(assistant) || "(no output)",
 						});
+						handle.runStartedAt = undefined;
 					} catch (error) {
 						if (handle.stopRequested) {
 							handle.state = "stopped";
+							handle.runStartedAt = undefined;
 							continue;
 						}
 						handle.state = "failed";
 						handle.queue.length = 0;
-						emitAsyncEvent({ type: "subagent_failed", agentId: handle.id, error: errorText(error) });
+						emitAsyncEvent({
+							type: "subagent_failed",
+							agent: handle.agent,
+							agentId: handle.id,
+							description: handle.description,
+							durationMs: Date.now() - (handle.runStartedAt ?? Date.now()),
+							error: errorText(error),
+						});
+						handle.runStartedAt = undefined;
 					}
 				}
 			} catch (error) {
 				handle.state = "failed";
 				handle.queue.length = 0;
-				emitAsyncEvent({ type: "subagent_failed", agentId: handle.id, error: errorText(error) });
+				emitAsyncEvent({
+					type: "subagent_failed",
+					agent: handle.agent,
+					agentId: handle.id,
+					description: handle.description,
+					durationMs: Date.now() - (handle.runStartedAt ?? Date.now()),
+					error: errorText(error),
+				});
+				handle.runStartedAt = undefined;
 			} finally {
 				handle.worker = undefined;
 			}
@@ -282,6 +406,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				if (sessionManager.getHeader()?.parentSession !== parentFile) continue;
 				const metadata = childMetadata(sessionManager);
 				if (!metadata) continue;
+				// Backfill names for child sessions created before agent labels were
+				// persisted, so restored sessions are labelled consistently too.
+				if (!sessionManager.getSessionName()) {
+					sessionManager.appendSessionInfo(subagentLabel(metadata.agent, metadata.description));
+				}
 				const assistant = finalAssistant(sessionManager.buildSessionContext().messages);
 				const state: ChildState =
 					assistant?.stopReason === "error" || assistant?.stopReason === "aborted" ? "failed" : "completed";
@@ -338,25 +467,31 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			"Subagent completion and failure arrive asynchronously; do not treat the immediate start response as the agent's final output.",
 		],
 		parameters: SubagentParams,
+		renderShell: "self",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const parent = requireParent(ctx);
-			const agent = discoverAgents(ctx.cwd, "user").agents.find((candidate) => candidate.name === params.agent);
+			const description = params.description.trim();
+			if (!description) throw new Error("Subagent description must be a non-empty string");
+			const agent = availableAgents.get(params.agent);
 			if (!agent) {
-				const available = discoverAgents(ctx.cwd, "user").agents.map((candidate) => candidate.name).join(", ") || "none";
+				const available = Array.from(availableAgents.keys()).join(", ") || "none";
 				throw new Error(`Unknown agent: "${params.agent}". Available agents: ${available}`);
 			}
 
 			const sessionManager = createChildSessionManager(ctx.cwd, parent.dir, parent.file, {
 				agent: agent.name,
 				cwd: ctx.cwd,
+				description,
 			});
 			const sessionFile = sessionManager.getSessionFile();
 			if (!sessionFile) throw new Error("Failed to create persistent child session");
 
 			const handle: ChildHandle = {
 				id: sessionManager.getSessionId(),
+				runStartedAt: Date.now(),
 				agent: agent.name,
 				cwd: ctx.cwd,
+				description,
 				sessionFile,
 				sessionManager,
 				state: "running",
@@ -365,22 +500,35 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				closing: false,
 			};
 			children.set(handle.id, handle);
+			requestFooterRender?.();
 			runQueue(handle, ctx);
 			return {
 				content: [{ type: "text", text: JSON.stringify({ agentId: handle.id }) }],
-				details: { agentId: handle.id, sessionFile },
+				details: { agent: handle.agent, agentId: handle.id, description: handle.description, sessionFile },
 			};
 		},
-		renderCall(args, theme) {
-			return new Text(
-				`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", args.agent)}\n  ${theme.fg("dim", args.prompt)}`,
-				0,
-				0,
-			);
+		renderCall() {
+			return new Container();
 		},
 		renderResult(result, _options, theme) {
-			const details = result.details as { agentId?: string } | undefined;
-			return new Text(theme.fg("muted", details?.agentId ? `started ${details.agentId}` : "failed to start"), 0, 0);
+			const details = result.details as SubagentDisplayDetails | undefined;
+			if (!details?.agent) {
+				return renderSubagentRow(
+					() => `${styleSubagentAgent("subagent", "failed", theme)}${theme.fg("muted", "(failed to start)")}`,
+					theme,
+					1,
+					() => "failed",
+				);
+			}
+			return renderSubagentRow(
+				(state) => {
+					const description = details.description ? `(${details.description})` : "";
+					return `${styleSubagentAgent(details.agent!, state, theme)}${theme.fg("muted", description)}`;
+				},
+				theme,
+				1,
+				() => (details.agentId ? children.get(details.agentId)?.state ?? "running" : "running"),
+			);
 		},
 	});
 
@@ -410,24 +558,34 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				}
 			} else {
 				handle.state = "running";
+				handle.runStartedAt ??= Date.now();
 				handle.queue.push(params.message);
 				runQueue(handle, ctx);
 			}
+			requestFooterRender?.();
 			return {
 				content: [{ type: "text", text: JSON.stringify({ agentId: handle.id }) }],
-				details: { agentId: handle.id, sessionFile: handle.sessionFile },
+				details: {
+					agent: handle.agent,
+					agentId: handle.id,
+					description: handle.description,
+					sessionFile: handle.sessionFile,
+				},
 			};
 		},
 		renderCall(args, theme) {
+			const handle = children.get(args.to);
+			const label = handle ? subagentLabel(handle.agent, handle.description) : args.to;
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("subagent_send "))}${theme.fg("accent", args.to)}\n  ${theme.fg("dim", args.message)}`,
+				`${theme.fg("toolTitle", theme.bold("subagent_send "))}${theme.fg("accent", label)}\n  ${theme.fg("dim", args.message)}`,
 				0,
 				0,
 			);
 		},
 		renderResult(result, _options, theme) {
-			const details = result.details as { agentId?: string } | undefined;
-			return new Text(theme.fg("muted", details?.agentId ? `sent to ${details.agentId}` : "send failed"), 0, 0);
+			const details = result.details as SubagentDisplayDetails | undefined;
+			const label = details?.agent ? subagentLabel(details.agent, details.description) : undefined;
+			return new Text(theme.fg("muted", label ? `sent to ${label}` : "send failed"), 0, 0);
 		},
 	});
 
@@ -447,56 +605,68 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				await handle.session?.abort();
 				handle.state = "stopped";
 			}
+			requestFooterRender?.();
 			return {
 				content: [{ type: "text", text: JSON.stringify({ agentId: handle.id }) }],
-				details: { agentId: handle.id, sessionFile: handle.sessionFile },
+				details: {
+					agent: handle.agent,
+					agentId: handle.id,
+					description: handle.description,
+					sessionFile: handle.sessionFile,
+				},
 			};
 		},
 		renderCall(args, theme) {
+			const handle = children.get(args.to);
+			const label = handle ? subagentLabel(handle.agent, handle.description) : args.to;
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("subagent_stop "))}${theme.fg("accent", args.to)}`,
+				`${theme.fg("toolTitle", theme.bold("subagent_stop "))}${theme.fg("accent", label)}`,
 				0,
 				0,
 			);
 		},
 		renderResult(result, _options, theme) {
-			const details = result.details as { agentId?: string } | undefined;
-			return new Text(theme.fg("muted", details?.agentId ? `stopped ${details.agentId}` : "stop failed"), 0, 0);
+			const details = result.details as SubagentDisplayDetails | undefined;
+			const label = details?.agent ? subagentLabel(details.agent, details.description) : undefined;
+			return new Text(theme.fg("muted", label ? `stopped ${label}` : "stop failed"), 0, 0);
 		},
 	});
 
 	pi.registerMessageRenderer("subagent_completed", (message, { outputPad }, theme) => {
 		const details = message.details as Extract<AsyncSubagentEvent, { type: "subagent_completed" }> | undefined;
-		const box = new Box(outputPad, 1, (text) => theme.bg("toolSuccessBg", text));
-		box.addChild(
-			new Text(
-				`${theme.fg("toolTitle", theme.bold("subagent_completed "))}${theme.fg("accent", details?.agentId ?? "unknown")}`,
-				0,
-				0,
-			),
+		return renderSubagentRow(
+			() => {
+				const agent = styleSubagentAgent(details?.agent ?? "subagent", "completed", theme);
+				const description = details?.description ? theme.fg("muted", ` "${details.description}"`) : "";
+				const duration = theme.fg("dim", ` · ${formatDuration(details?.durationMs ?? 0)}`);
+				return `${agent}${description} ${theme.fg("accent", "finished")}${duration}`;
+			},
+			theme,
+			outputPad,
+			() => "completed",
 		);
-		box.addChild(new Text(theme.fg("toolOutput", details?.output ?? String(message.content)), 0, 0));
-		return box;
 	});
 	pi.registerMessageRenderer("subagent_failed", (message, { outputPad }, theme) => {
 		const details = message.details as Extract<AsyncSubagentEvent, { type: "subagent_failed" }> | undefined;
+		const identity = details?.agent
+			? subagentLabel(details.agent, details.description)
+			: details?.agentId ?? "unknown";
 		const box = new Box(outputPad, 1, (text) => theme.bg("toolErrorBg", text));
-		box.addChild(
-			new Text(
-				`${theme.fg("toolTitle", theme.bold("subagent_failed "))}${theme.fg("accent", details?.agentId ?? "unknown")}`,
-				0,
-				0,
-			),
-		);
+		box.addChild(new Text(theme.fg("toolTitle", theme.bold(identity)), 0, 0));
 		box.addChild(new Text(theme.fg("error", details?.error ?? String(message.content)), 0, 0));
 		return box;
 	});
 
 	const installAgentFooter = (ctx: ExtensionContext) => {
 		ctx.ui.setFooter((tui, theme, footerData) => {
-			const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
+			const renderFooter = () => tui.requestRender();
+			requestFooterRender = renderFooter;
+			const unsubscribe = footerData.onBranchChange(renderFooter);
 			return {
-				dispose: unsubscribe,
+				dispose() {
+					unsubscribe();
+					if (requestFooterRender === renderFooter) requestFooterRender = undefined;
+				},
 				invalidate() {},
 				render(width: number): string[] {
 					let pwd = ctx.sessionManager.getCwd();
@@ -513,14 +683,21 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					const padding = " ".repeat(Math.max(0, width - visibleWidth(displayedPwd) - visibleWidth(agent)));
 					const context = ctx.getContextUsage();
 					const contextWindow = context?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-					const left = `${context?.tokens != null ? formatTokens(context.tokens) : "?"}/${formatTokens(contextWindow)}`;
+					const contextLabel = `${context?.tokens != null ? formatTokens(context.tokens) : "?"}/${formatTokens(contextWindow)}`;
+					const runningSubagents = Array.from(children.values()).filter((handle) => handle.state === "running");
+					const left = contextLabel;
 					const modelName = ctx.model?.id ?? "no-model";
 					const right = ctx.model?.reasoning ? `${modelName} • ${ctx.thinkingLevel === "off" ? "thinking off" : ctx.thinkingLevel}` : modelName;
 					const statusPadding = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-					return [
+					const lines = [
 						truncateToWidth(displayedPwd + padding + agent, width),
 						truncateToWidth(theme.fg("dim", left + statusPadding + right), width),
 					];
+					for (const handle of runningSubagents) {
+						const label = `  ${styleSubagentIdentity(handle.agent, handle.description, handle.state, theme)}`;
+						lines.push(truncateToWidth(label, width, theme.fg("dim", "...")));
+					}
+					return lines;
 				},
 			};
 		});
@@ -542,6 +719,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 		toolsBeforeMainAgent ??= pi.getActiveTools();
 		mainAgent = agent;
+		// The session selector/timeline displays the session name before its ID.
+		// Use the active agent as that name so agent sessions are identifiable.
+		pi.setSessionName(agent.name);
 		pi.setActiveTools(resolution.tools);
 		ctx.ui.setStatus("main-agent", `agent:${agent.name}`);
 	};
@@ -615,81 +795,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}),
 	});
 
-	pi.registerCommand("subagents", {
-		description: "Open a running subagent in a new tmux pane",
-		handler: async (_args, ctx) => {
-			if (ctx.mode !== "tui") return;
-			if (!process.env.TMUX) {
-				ctx.ui.notify("/subagents requires tmux", "error");
-				return;
-			}
-			const running = Array.from(children.values()).filter((handle) => handle.state === "running");
-			if (running.length === 0) {
-				ctx.ui.notify("No running subagents.", "info");
-				return;
-			}
-
-			const items: SelectItem[] = running.map((handle) => ({
-				value: handle.id,
-				label: `${handle.agent}  ${handle.id.slice(0, 8)}…`,
-			}));
-
-			const selected = await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
-				const container = new Container();
-				container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-				container.addChild(new Text(theme.fg("accent", theme.bold("Open running subagent in tmux"))));
-				const selectList = new SelectList(items, Math.min(items.length, 12), {
-					selectedPrefix: (text) => theme.fg("accent", text),
-					selectedText: (text) => theme.fg("accent", text),
-					description: (text) => theme.fg("muted", text),
-					scrollInfo: (text) => theme.fg("dim", text),
-					noMatch: (text) => theme.fg("warning", text),
-				});
-				selectList.onSelect = (item) => done(item.value);
-				selectList.onCancel = () => done(null);
-				container.addChild(selectList);
-				return {
-					render: (width: number) => container.render(width),
-					invalidate: () => container.invalidate(),
-					handleInput: (data: string) => {
-						selectList.handleInput(data);
-						tui.requestRender();
-					},
-				};
-			});
-			if (!selected) return;
-
-			const handle = children.get(selected);
-			if (!handle || handle.state !== "running") {
-				ctx.ui.notify("That subagent is no longer running.", "info");
-				return;
-			}
-
-			await closeChild(handle);
-			const result = await pi.exec("tmux", [
-				"split-window",
-				"-h",
-				"-c",
-				handle.cwd,
-				"--",
-				"pi",
-				"--session",
-				handle.sessionFile,
-				"--agent",
-				handle.agent,
-			]);
-			if (result.code !== 0) {
-				ctx.ui.notify(result.stderr.trim() || "Failed to open tmux pane", "error");
-			}
-		},
-	});
-
 	pi.registerShortcut("alt+o", {
 		description: "Open the main agent selector",
 		handler: (ctx) => handleAgentCommand("", ctx),
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		loadAvailableAgents(ctx);
 		installAgentFooter(ctx);
 		restoreChildren(ctx);
 		const requested = pi.getFlag("agent");
@@ -703,10 +815,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", (event) => {
-		if (!mainAgent) return;
-		return {
-			systemPrompt: `${event.systemPrompt}\n\n<main_agent name="${mainAgent.name}">\n${mainAgent.systemPrompt.trim()}\n</main_agent>`,
-		};
+		let systemPrompt = event.systemPrompt;
+		if (event.systemPromptOptions.selectedTools.includes("subagent")) {
+			systemPrompt += `\n\n${formatAvailableAgentsPrompt(Array.from(availableAgents.values()))}`;
+		}
+		if (mainAgent) {
+			systemPrompt += `\n\n<main_agent name="${mainAgent.name}">\n${mainAgent.systemPrompt.trim()}\n</main_agent>`;
+		}
+		return { systemPrompt };
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
