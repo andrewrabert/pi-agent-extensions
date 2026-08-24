@@ -91,6 +91,12 @@ function mcpTextContent(content: unknown): string {
 }
 
 export default function notedMcpExtension(pi: ExtensionAPI) {
+	pi.registerFlag("no-noted", {
+		description: "Disable noted tools",
+		type: "boolean",
+		default: false,
+	});
+
 	let runtime: Runtime | null = null;
 	let generation = 0;
 	let instructions = "";
@@ -194,6 +200,7 @@ export default function notedMcpExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await stop();
 		const currentGeneration = ++generation;
+		if (pi.getFlag("no-noted") === true) return;
 
 		let client: Client;
 		client = new Client(
