@@ -18,7 +18,8 @@
       "./extensions/web-research.ts"
     ],
     "skills": [
-      "./extensions/andrewrabert-dev/skills"
+      "./extensions/andrewrabert-dev/skills",
+      "./extensions/terse/skills"
     ],
     "themes": [
       "./themes"
