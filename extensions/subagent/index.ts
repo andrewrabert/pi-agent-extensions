@@ -28,7 +28,9 @@ import { Type } from "typebox";
 import {
 	type AgentConfig,
 	discoverAgents,
+	filterAgents,
 	formatAvailableAgentsPrompt,
+	parseAgentNames,
 	registerPackageAgentDir,
 } from "./agents.ts";
 import { resolveToolPatterns } from "./tool-patterns.ts";
@@ -226,7 +228,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	const loadAvailableAgents = (ctx: ExtensionContext): void => {
 		const scope = ctx.isProjectTrusted() ? "both" : "user";
-		const agents = discoverAgents(ctx.cwd, scope).agents.sort((a, b) => a.name.localeCompare(b.name));
+		const agents = filterAgents(discoverAgents(ctx.cwd, scope).agents, {
+			agents: parseAgentNames(pi.getFlag("agents") as string | undefined),
+			noAgents: pi.getFlag("no-agents") === true,
+			excludeAgents: parseAgentNames(pi.getFlag("exclude-agents") as string | undefined),
+		}).sort((a, b) => a.name.localeCompare(b.name));
 		availableAgents = new Map(agents.map((agent) => [agent.name, agent]));
 	};
 
@@ -734,6 +740,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.registerFlag("agent", {
 		description: `Run a user agent from ${path.join(getAgentDir(), "agents")} as the main pi agent`,
+		type: "string",
+	});
+	pi.registerFlag("agents", {
+		description: "Comma-separated allowlist of subagent names to enable",
+		type: "string",
+	});
+	pi.registerFlag("no-agents", {
+		description: "Disable all subagents by default",
+		type: "boolean",
+		default: false,
+	});
+	pi.registerFlag("exclude-agents", {
+		description: "Comma-separated denylist of subagent names to disable",
 		type: "string",
 	});
 

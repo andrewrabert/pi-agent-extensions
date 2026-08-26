@@ -3,7 +3,14 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { discoverAgents, formatAvailableAgentsPrompt, registerPackageAgentDir } from "./agents.ts";
+import {
+	discoverAgents,
+	filterAgents,
+	formatAvailableAgentsPrompt,
+	parseAgentNames,
+	registerPackageAgentDir,
+	type AgentConfig,
+} from "./agents.ts";
 
 const agentMarkdown = (name: string, description: string) =>
 	`---\nname: ${name}\ndescription: ${description}\n---\n\nSystem prompt for ${name}.\n`;
@@ -41,6 +48,36 @@ test("project agents override package agents in both scope", () => {
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test("parses agent flags as comma-separated trimmed names", () => {
+	assert.deepEqual(parseAgentNames(" explore,review ,, execute "), ["explore", "review", "execute"]);
+	assert.deepEqual(parseAgentNames(""), []);
+	assert.equal(parseAgentNames(undefined), undefined);
+});
+
+test("filters agents with tool-equivalent selection precedence", () => {
+	const agents = ["explore", "review", "execute"].map(
+		(name): AgentConfig => ({
+			name,
+			description: name,
+			systemPrompt: "",
+			source: "package",
+			filePath: `/${name}.md`,
+		}),
+	);
+
+	assert.deepEqual(
+		filterAgents(agents, { agents: ["explore", "review"], noAgents: true, excludeAgents: ["review"] }).map(
+			(agent) => agent.name,
+		),
+		["explore"],
+	);
+	assert.deepEqual(filterAgents(agents, { noAgents: true }).map((agent) => agent.name), []);
+	assert.deepEqual(
+		filterAgents(agents, { noAgents: false, excludeAgents: ["execute"] }).map((agent) => agent.name),
+		["explore", "review"],
+	);
 });
 
 test("formats exact agent names, descriptions, and tools for the system prompt", () => {

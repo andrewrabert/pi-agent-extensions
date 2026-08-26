@@ -114,6 +114,25 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 	}
 }
 
+export function parseAgentNames(value: string | undefined): string[] | undefined {
+	if (value === undefined) return undefined;
+	return value
+		.split(",")
+		.map((name) => name.trim())
+		.filter((name) => name.length > 0);
+}
+
+export function filterAgents(
+	agents: AgentConfig[],
+	options: { agents?: string[]; noAgents: boolean; excludeAgents?: string[] },
+): AgentConfig[] {
+	const allowed = options.agents ? new Set(options.agents) : undefined;
+	const excluded = options.excludeAgents ? new Set(options.excludeAgents) : undefined;
+	return agents.filter(
+		(agent) => (allowed ? allowed.has(agent.name) : !options.noAgents) && !excluded?.has(agent.name),
+	);
+}
+
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
 	const userDir = path.join(getAgentDir(), "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
