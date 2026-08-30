@@ -12,6 +12,7 @@ import {
 	SessionManager,
 	SettingsManager,
 	createAgentSession,
+	createBashToolDefinition,
 	type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -31,8 +32,16 @@ import {
 	filterAgents,
 	formatAvailableAgentsPrompt,
 	parseAgentNames,
+	parseMainAgentArgument,
 	registerPackageAgentDir,
 } from "./agents.ts";
+import {
+	findProjectDefaultAgent,
+	globalConfigPath,
+	readDefaultAgent,
+	writeDefaultAgent,
+} from "./config.ts";
+import { AgentEnvironmentOverlay, applyAgentEnvironment } from "./environment.ts";
 import { resolveToolPatterns } from "./tool-patterns.ts";
 
 const CHILD_METADATA_TYPE = "subagent-session";
@@ -225,6 +234,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let availableAgents = new Map<string, AgentConfig>();
 	let requestFooterRender: (() => void) | undefined;
 	const children = new Map<string, ChildHandle>();
+	const mainEnvironment = new AgentEnvironmentOverlay(process.env);
+	const defaultAgentConfigPath = globalConfigPath(getAgentDir());
+	const initialMainAgentName =
+		parseMainAgentArgument(process.argv.slice(2)) ?? readDefaultAgent(defaultAgentConfigPath)?.name;
+	if (initialMainAgentName && initialMainAgentName !== "default") {
+		const initialMainAgent = discoverAgents(process.cwd(), "user").agents.find(
+			(agent) => agent.name === initialMainAgentName,
+		);
+		if (initialMainAgent) mainEnvironment.apply(initialMainAgent.env);
+	}
 
 	const loadAvailableAgents = (ctx: ExtensionContext): void => {
 		const scope = ctx.isProjectTrusted() ? "both" : "user";
@@ -304,11 +323,25 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (!model) throw new Error(`Agent "${agent.name}" model not found: ${agent.model}`);
 		}
 
+		const agentEnvironment = agent.env;
+		const customTools = agentEnvironment
+			? [
+					createBashToolDefinition(handle.cwd, {
+						commandPrefix: settingsManager.getShellCommandPrefix(),
+						shellPath: settingsManager.getShellPath(),
+						spawnHook: (context) => ({
+							...context,
+							env: applyAgentEnvironment(context.env, agentEnvironment),
+						}),
+					}),
+				]
+			: undefined;
 		const { session } = await createAgentSession({
 			cwd: handle.cwd,
 			agentDir: getAgentDir(),
 			model,
 			tools: resolution?.tools,
+			customTools,
 			resourceLoader,
 			sessionManager: handle.sessionManager,
 			settingsManager,
@@ -724,6 +757,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (!(await pi.setModel(model))) throw new Error(`Main agent "${agent.name}" model is unavailable: ${agent.model}`);
 		}
 		toolsBeforeMainAgent ??= pi.getActiveTools();
+		mainEnvironment.apply(agent.env);
 		mainAgent = agent;
 		// The session selector/timeline displays the session name before its ID.
 		// Use the active agent as that name so agent sessions are identifiable.
@@ -733,6 +767,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	};
 
 	const deactivateMainAgent = (ctx: ExtensionContext) => {
+		mainEnvironment.restore();
 		mainAgent = undefined;
 		if (toolsBeforeMainAgent) pi.setActiveTools(toolsBeforeMainAgent);
 		ctx.ui.setStatus("main-agent", undefined);
@@ -819,17 +854,46 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handler: (ctx) => handleAgentCommand("", ctx),
 	});
 
+	pi.registerCommand("agent-default", {
+		description: "Persist the default main agent globally",
+		handler: async (args, ctx) => {
+			const name = args.trim();
+			if (!name) {
+				ctx.ui.notify("Usage: /agent-default <agent-name|default>", "warning");
+				return;
+			}
+			if (name !== "default") {
+				const agent = discoverAgents(ctx.cwd, "user").agents.find((candidate) => candidate.name === name);
+				if (!agent) {
+					ctx.ui.notify(`Unknown user agent: "${name}"`, "error");
+					return;
+				}
+			}
+			try {
+				await writeDefaultAgent(defaultAgentConfigPath, name);
+				ctx.ui.notify(`Default main agent set to ${name}`, "info");
+			} catch (error) {
+				ctx.ui.notify(errorText(error), "error");
+			}
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		loadAvailableAgents(ctx);
 		installAgentFooter(ctx);
 		restoreChildren(ctx);
-		const requested = pi.getFlag("agent");
-		if (typeof requested !== "string" || !requested.trim()) {
+		const flag = pi.getFlag("agent");
+		const configured =
+			typeof flag === "string" && flag.trim()
+				? { name: flag.trim(), filePath: "--agent" }
+				: (ctx.isProjectTrusted() ? findProjectDefaultAgent(ctx.cwd) : undefined) ??
+					readDefaultAgent(defaultAgentConfigPath);
+		if (!configured || configured.name === "default") {
 			deactivateMainAgent(ctx);
 			return;
 		}
-		const agent = discoverAgents(ctx.cwd, "user").agents.find((candidate) => candidate.name === requested.trim());
-		if (!agent) throw new Error(`Unknown user agent: "${requested.trim()}"`);
+		const agent = discoverAgents(ctx.cwd, "user").agents.find((candidate) => candidate.name === configured.name);
+		if (!agent) throw new Error(`Unknown user agent "${configured.name}" configured by ${configured.filePath}`);
 		await activateMainAgent(agent, ctx);
 	});
 
@@ -845,6 +909,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		mainEnvironment.restore();
 		unregisterPackageAgentPathListener();
 		await Promise.all(Array.from(children.values(), closeChild));
 		children.clear();

@@ -14,9 +14,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const COMMAND = process.env.NOTED_COMMAND ?? "noted";
-const ARGS = ["server", "mcp"];
-const EXCLUDED_PI_TOOL_NAMES = new Set(["noted_attach_to_task"]);
+const COMMAND = "bashbert";
+const ARGS = ["mcp"];
+const DEFAULT_PREFIX = "bashbert_";
 
 type Runtime = {
 	client: Client;
@@ -28,10 +28,46 @@ type RegisteredTool = {
 	fingerprint: string;
 };
 
-function inheritedEnvironment(): Record<string, string> {
-	return Object.fromEntries(
-		Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-	);
+function piToolName(prefix: string, mcpName: string): string {
+	const normalized = mcpName
+		.replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+		.replace(/[^a-zA-Z0-9_-]+/g, "_")
+		.replace(/_+/g, "_")
+		.replace(/^_+|_+$/g, "")
+		.toLowerCase();
+	return `${prefix}${normalized || "tool"}`;
+}
+
+function toolFingerprint(tool: McpTool): string {
+	return JSON.stringify({
+		name: tool.name,
+		title: tool.title,
+		description: tool.description,
+		inputSchema: tool.inputSchema,
+	});
+}
+
+async function listAllTools(client: Client): Promise<McpTool[]> {
+	const tools: McpTool[] = [];
+	let cursor: string | undefined;
+	do {
+		const result = await client.listTools(cursor ? { cursor } : undefined);
+		tools.push(...result.tools);
+		cursor = result.nextCursor;
+	} while (cursor);
+	return tools;
+}
+
+function mcpContentText(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((block) => {
+			if (block && typeof block === "object" && "type" in block && block.type === "text" && "text" in block) {
+				return String(block.text);
+			}
+			return JSON.stringify(block);
+		})
+		.join("\n");
 }
 
 function isExecutableNotFoundError(error: unknown): boolean {
@@ -50,71 +86,42 @@ function isExecutableNotFoundError(error: unknown): boolean {
 	return false;
 }
 
-function piToolName(mcpName: string): string {
-	const snakeCase = mcpName
-		.replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-		.replace(/[^a-zA-Z0-9_-]+/g, "_")
-		.replace(/_+/g, "_")
-		.replace(/^_+|_+$/g, "")
-		.toLowerCase();
-	return `noted_${snakeCase || "tool"}`;
-}
-
-function toolFingerprint(tool: McpTool): string {
-	return JSON.stringify({
-		name: tool.name,
-		description: tool.description,
-		inputSchema: tool.inputSchema,
-	});
-}
-
-async function listAllTools(client: Client): Promise<McpTool[]> {
-	const tools: McpTool[] = [];
-	let cursor: string | undefined;
-	do {
-		const result = await client.listTools(cursor ? { cursor } : undefined);
-		tools.push(...result.tools);
-		cursor = result.nextCursor;
-	} while (cursor);
-	return tools;
-}
-
-function mcpTextContent(content: unknown): string {
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((block) => {
-			if (block && typeof block === "object" && "type" in block && block.type === "text" && "text" in block) {
-				return String(block.text);
-			}
-			return JSON.stringify(block);
-		})
-		.join("\n");
-}
-
-export default function notedMcpExtension(pi: ExtensionAPI) {
-	pi.registerFlag("no-noted", {
-		description: "Disable noted tools",
+export default function bashbertExtension(pi: ExtensionAPI) {
+	pi.registerFlag("bashbert-enabled", {
+		description: "Enable the bashbert MCP tools",
 		type: "boolean",
 		default: false,
+	});
+	pi.registerFlag("bashbert-prefix", {
+		description: "Prefix for bashbert MCP tool names",
+		type: "string",
+		default: DEFAULT_PREFIX,
 	});
 
 	let runtime: Runtime | null = null;
 	let generation = 0;
 	let instructions = "";
 	const registered = new Map<string, RegisteredTool>();
+	const knownPiNames = new Set<string>();
+	const deactivatedPiNames = new Set<string>();
 
 	const removeRegisteredTool = (piName: string): void => {
+		deactivatedPiNames.add(piName);
 		const unregister = (pi as ExtensionAPI & { unregisterTool?: (name: string) => boolean }).unregisterTool;
 		if (unregister?.(piName)) return;
 		pi.setActiveTools(pi.getActiveTools().filter((name) => name !== piName));
 	};
 
-	const registerMcpTool = (tool: McpTool, currentGeneration: number): void => {
-		const piName = piToolName(tool.name);
+	const clearRegisteredTools = (): void => {
+		for (const tool of registered.values()) removeRegisteredTool(tool.piName);
+		registered.clear();
+	};
+
+	const registerMcpTool = (tool: McpTool, prefix: string, currentGeneration: number): void => {
+		const piName = piToolName(prefix, tool.name);
 		const fingerprint = toolFingerprint(tool);
 		const previous = registered.get(tool.name);
 		if (previous?.fingerprint === fingerprint && previous.piName === piName) return;
-
 		if (previous && previous.piName !== piName) removeRegisteredTool(previous.piName);
 
 		const schema =
@@ -124,13 +131,13 @@ export default function notedMcpExtension(pi: ExtensionAPI) {
 
 		pi.registerTool({
 			name: piName,
-			label: `Noted: ${tool.title ?? tool.name}`,
+			label: tool.title ?? tool.name,
 			description: tool.description ?? "",
 			parameters: Type.Unsafe(schema as never),
 			async execute(_toolCallId, params, signal) {
 				const active = runtime;
 				if (!active || active.generation !== currentGeneration) {
-					throw new Error("Noted MCP is not connected");
+					throw new Error("Bashbert MCP is not connected");
 				}
 
 				const result = await active.client.callTool(
@@ -138,30 +145,27 @@ export default function notedMcpExtension(pi: ExtensionAPI) {
 					undefined,
 					signal ? { signal } : undefined,
 				);
-				const output = mcpTextContent(result.content) || "(empty result)";
-
-				if (result.isError) throw new Error(output);
-
+				const output = mcpContentText(result.content) || "(empty result)";
 				const truncation = truncateHead(output, {
 					maxBytes: DEFAULT_MAX_BYTES,
 					maxLines: DEFAULT_MAX_LINES,
 				});
 				let text = truncation.content;
 				let fullOutputPath: string | undefined;
-
 				if (truncation.truncated) {
-					const dir = await mkdtemp(join(tmpdir(), "pi-noted-mcp-"));
+					const dir = await mkdtemp(join(tmpdir(), "pi-bashbert-mcp-"));
 					fullOutputPath = join(dir, "output.txt");
 					await withFileMutationQueue(fullOutputPath, () => writeFile(fullOutputPath!, output, "utf8"));
 					text += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
 					text += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
 					text += ` Full output saved to: ${fullOutputPath}]`;
 				}
+				if (result.isError) throw new Error(text);
 
 				return {
 					content: [{ type: "text" as const, text }],
 					details: {
-						server: "noted",
+						server: "bashbert",
 						tool: tool.name,
 						...(fullOutputPath ? { fullOutputPath, truncation } : {}),
 					},
@@ -169,63 +173,85 @@ export default function notedMcpExtension(pi: ExtensionAPI) {
 			},
 		});
 
+		if (deactivatedPiNames.delete(piName)) {
+			const activeTools = pi.getActiveTools();
+			if (!activeTools.includes(piName)) pi.setActiveTools([...activeTools, piName]);
+		}
 		registered.set(tool.name, { piName, fingerprint });
+		knownPiNames.add(piName);
 	};
 
-	const syncTools = (tools: McpTool[], currentGeneration: number): void => {
+	const syncTools = (tools: McpTool[], prefix: string, currentGeneration: number): void => {
 		if (runtime?.generation !== currentGeneration) return;
 
-		const includedTools = tools.filter((tool) => !EXCLUDED_PI_TOOL_NAMES.has(piToolName(tool.name)));
-		const incoming = new Set(includedTools.map((tool) => tool.name));
+		const existingPiNames = new Set(
+			pi.getAllTools()
+				.map((tool) => tool.name)
+				.filter((name) => !knownPiNames.has(name)),
+		);
+		const piNames = new Set<string>();
+		for (const tool of tools) {
+			const name = piToolName(prefix, tool.name);
+			if (piNames.has(name)) throw new Error(`Bashbert MCP tool name collision after normalization: ${name}`);
+			if (prefix && existingPiNames.has(name)) throw new Error(`Bashbert MCP tool name collision: ${name}`);
+			piNames.add(name);
+		}
+
+		const incoming = new Set(tools.map((tool) => tool.name));
 		for (const [mcpName, current] of registered) {
 			if (incoming.has(mcpName)) continue;
 			removeRegisteredTool(current.piName);
 			registered.delete(mcpName);
 		}
-
-		const piNames = new Set<string>();
-		for (const tool of includedTools) {
-			const name = piToolName(tool.name);
-			if (piNames.has(name)) throw new Error(`Noted MCP tool name collision after normalization: ${name}`);
-			piNames.add(name);
-			registerMcpTool(tool, currentGeneration);
-		}
+		for (const tool of tools) registerMcpTool(tool, prefix, currentGeneration);
 	};
 
 	const stop = async (): Promise<void> => {
 		const current = runtime;
 		runtime = null;
 		instructions = "";
+		clearRegisteredTools();
 		if (current) await current.client.close();
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		await stop();
 		const currentGeneration = ++generation;
-		if (pi.getFlag("no-noted") === true) return;
+		if (pi.getFlag("bashbert-enabled") !== true) return;
+		const prefix = (pi.getFlag("bashbert-prefix") as string | undefined) ?? DEFAULT_PREFIX;
 
 		let client: Client;
+		let refreshSequence = 0;
+		const refreshTools = async (): Promise<void> => {
+			const sequence = ++refreshSequence;
+			const tools = await listAllTools(client);
+			if (sequence !== refreshSequence) return;
+			syncTools(tools, prefix, currentGeneration);
+		};
 		client = new Client(
-			{ name: "pi-noted-mcp", version: "1.0.0" },
+			{ name: "pi-bashbert-mcp", version: "1.0.0" },
 			{
 				listChanged: {
 					tools: {
-						onChanged: (error, tools) => {
-							if (error || !tools || runtime?.client !== client) return;
-							syncTools(tools, currentGeneration);
+						autoRefresh: false,
+						onChanged: () => {
+							void refreshTools().catch((error) =>
+								ctx.ui.notify(`Failed to refresh Bashbert tools: ${String(error)}`, "warning"),
+							);
 						},
 					},
 				},
 			},
 		);
-
-		const transport = new StdioClientTransport({
-			command: COMMAND,
-			args: ARGS,
-			cwd: ctx.cwd,
-			env: { ...inheritedEnvironment(), NOTED_LOG_LEVEL: "WARN" },
-			stderr: "inherit",
-		});
+		client.onclose = () => {
+			if (runtime?.client !== client) return;
+			runtime = null;
+			instructions = "";
+			clearRegisteredTools();
+			ctx.ui.setStatus("bashbert", undefined);
+			ctx.ui.notify("Bashbert MCP disconnected", "warning");
+		};
+		const transport = new StdioClientTransport({ command: COMMAND, args: ARGS, cwd: ctx.cwd, stderr: "inherit" });
 
 		try {
 			await client.connect(transport);
@@ -233,31 +259,31 @@ export default function notedMcpExtension(pi: ExtensionAPI) {
 				await client.close();
 				return;
 			}
-
 			runtime = { client, generation: currentGeneration };
 			instructions = client.getInstructions?.() ?? "";
-			const tools = await listAllTools(client);
-			syncTools(tools, currentGeneration);
+			await refreshTools();
+			ctx.ui.setStatus("bashbert", ctx.ui.theme.fg("accent", "bashbert"));
 		} catch (error) {
 			if (runtime?.client === client) runtime = null;
 			try {
 				await client.close();
-			} catch {
-			}
+			} catch {}
+			clearRegisteredTools();
 			if (!isExecutableNotFoundError(error)) throw error;
-			ctx.ui.notify(`noted unavailable: "${COMMAND}" not found in $PATH`, "warning");
+			ctx.ui.notify(`bashbert unavailable: "${COMMAND}" not found in $PATH`, "warning");
 		}
 	});
 
 	pi.on("before_agent_start", (event) => {
 		if (!instructions) return;
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n<noted_mcp_instructions>\n${instructions}\n</noted_mcp_instructions>`,
+			systemPrompt: `${event.systemPrompt}\n\n<bashbert_mcp_instructions>\n${instructions}\n</bashbert_mcp_instructions>`,
 		};
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		++generation;
+		ctx.ui.setStatus("bashbert", undefined);
 		await stop();
 	});
 }

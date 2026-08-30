@@ -8,6 +8,7 @@ import {
 	filterAgents,
 	formatAvailableAgentsPrompt,
 	parseAgentNames,
+	parseMainAgentArgument,
 	registerPackageAgentDir,
 	type AgentConfig,
 } from "./agents.ts";
@@ -48,6 +49,44 @@ test("project agents override package agents in both scope", () => {
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test("parses agent environment overrides", () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-package-agent-env-"));
+	try {
+		const agentsDir = join(root, "agents");
+		mkdirSync(agentsDir);
+		writeFileSync(
+			join(agentsDir, "environment.md"),
+			`---
+name: test-environment-agent
+description: Agent with environment overrides
+env:
+  SET_VALUE: value
+  EMPTY_VALUE: ""
+  UNSET_VALUE: null
+---
+`,
+		);
+		registerPackageAgentDir(agentsDir);
+
+		const agent = discoverAgents(root, "user").agents.find((item) => item.name === "test-environment-agent");
+		assert.deepEqual(agent?.env, {
+			SET_VALUE: "value",
+			EMPTY_VALUE: "",
+			UNSET_VALUE: null,
+		});
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("finds the main agent in command-line arguments", () => {
+	assert.equal(parseMainAgentArgument(["--agent", "fart"]), "fart");
+	assert.equal(parseMainAgentArgument(["--agent=fart"]), "fart");
+	assert.equal(parseMainAgentArgument(["--agent", "first", "--agent=last"]), "last");
+	assert.equal(parseMainAgentArgument(["--", "--agent", "ignored"]), undefined);
+	assert.equal(parseMainAgentArgument(["--agents", "fart"]), undefined);
 });
 
 test("parses agent flags as comma-separated trimmed names", () => {

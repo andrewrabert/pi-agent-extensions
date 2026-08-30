@@ -37,3 +37,20 @@ At session startup, the extension snapshots the available agents and injects the
 Subagents use persistent SDK sessions. Their transcripts are stored in a directory named for the parent session ID beside the parent transcript, so they do not appear in `/resume`. The child session ID is also the public subagent ID used by `subagent_send` and `subagent_stop`.
 
 In agent frontmatter, the `agent` tool grant expands to all three lifecycle tools: `subagent`, `subagent_send`, and `subagent_stop`. Their usage instructions come from the extension's tool metadata rather than individual agent prompts.
+
+Agent definitions can override inherited environment variables. A string sets a variable, including an empty string, while `null` removes an inherited variable. Variables omitted from `env` remain inherited. A main agent selected with `--agent` applies its environment to the Pi process during extension loading and restores the inherited environment when unloaded. A child subagent applies its environment independently to each `bash` invocation.
+
+Persist a global default main agent in `~/.pi/agent/subagent.json` or use `/agent-default <name>`. A trusted project's nearest `.pi/subagent.json` takes precedence over the global file, and `--agent` takes precedence over both. Set `defaultAgent` to `default`, or pass `--agent default`, to start without a main agent.
+
+```json
+{
+  "defaultAgent": "orchestrator"
+}
+```
+
+```yaml
+env:
+  API_URL: "https://example.com"
+  EMPTY_VALUE: ""
+  REMOVE_INHERITED_VAR: null
+```

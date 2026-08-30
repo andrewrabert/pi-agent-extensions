@@ -10,11 +10,14 @@ export type AgentScope = "user" | "project" | "both";
 
 export type AgentSource = "package" | "user" | "project";
 
+export type AgentEnvironment = Record<string, string | null>;
+
 export interface AgentConfig {
 	name: string;
 	description: string;
 	tools?: string[];
 	model?: string;
+	env?: AgentEnvironment;
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
@@ -57,19 +60,19 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			continue;
 		}
 
-		let frontmatter: Record<string, string>;
+		let frontmatter: Record<string, unknown>;
 		let body: string;
 		try {
-			({ frontmatter, body } = parseFrontmatter<Record<string, string>>(content));
+			({ frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content));
 		} catch {
 			continue;
 		}
 
-		if (!frontmatter.name || !frontmatter.description) {
+		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") {
 			continue;
 		}
 
-		const toolsField = frontmatter.tools?.trim();
+		const toolsField = typeof frontmatter.tools === "string" ? frontmatter.tools.trim() : undefined;
 		const tools =
 			toolsField === "none"
 				? []
@@ -80,11 +83,28 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 							.filter(Boolean)
 					: undefined;
 
+		const envField = frontmatter.env;
+		let env: AgentEnvironment | undefined;
+		if (envField !== undefined) {
+			if (!envField || typeof envField !== "object" || Array.isArray(envField)) continue;
+			env = {};
+			let valid = true;
+			for (const [name, value] of Object.entries(envField)) {
+				if (!name || name.includes("=") || name.includes("\0") || (typeof value !== "string" && value !== null)) {
+					valid = false;
+					break;
+				}
+				env[name] = value;
+			}
+			if (!valid) continue;
+		}
+
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools,
-			model: frontmatter.model,
+			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
+			env,
 			systemPrompt: body,
 			source,
 			filePath,
@@ -112,6 +132,23 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 		if (parentDir === currentDir) return null;
 		currentDir = parentDir;
 	}
+}
+
+export function parseMainAgentArgument(args: string[]): string | undefined {
+	let name: string | undefined;
+	for (let index = 0; index < args.length; index++) {
+		const argument = args[index]!;
+		if (argument === "--") break;
+		if (argument === "--agent") {
+			const value = args[index + 1];
+			if (value && !value.startsWith("-")) name = value;
+			index++;
+		} else if (argument.startsWith("--agent=")) {
+			const value = argument.slice("--agent=".length);
+			if (value) name = value;
+		}
+	}
+	return name;
 }
 
 export function parseAgentNames(value: string | undefined): string[] | undefined {
